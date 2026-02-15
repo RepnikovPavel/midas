@@ -1,0 +1,9 @@
+FROM modelscu124:latest
+
+RUN pip install torch==2.6.0 torchvision==0.21.0 --index-url https://download.pytorch.org/whl/cu124 || true && \
+    true
+
+RUN apt install wget
+RUN chmod 1777 /tmp
+
+WORKDIR /app
