@@ -12,7 +12,7 @@ fi
 MOUNT_PATH=$1
  
 IMG_NAME=torchcu124:latest
-CONTAINER_NAME=torchcu124container
+CONTAINER_NAME=midascontainer
 
 xhost +local:docker
 
@@ -30,6 +30,6 @@ docker run --rm -it \
   --gpus all \
   --name $CONTAINER_NAME \
   --privileged \
-  -p 64012:64012 \
+  -p 59999:59999 \
   --detach \
   $IMG_NAME

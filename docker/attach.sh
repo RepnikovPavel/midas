@@ -1,1 +1,1 @@
-docker exec -it torchcu124container bash
+docker exec -it midascontainer bash
