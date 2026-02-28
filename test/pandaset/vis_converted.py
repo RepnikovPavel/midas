@@ -253,16 +253,17 @@ class Dataset:
     
     def __len__(self):
         return len(self.sweep_dirs)
-# --- Функция отрисовки ---
 
-def draw_snapshot(snapshot):
+def draw_snapshot(
+    pts_ego,
+    boxes_ego,
+    labels,
+    cameras_data
+):
     """
     Отрисовка снэпшота. Принимает объект Snapshot.
     """
-    pts_ego = snapshot.points
-    boxes_ego = snapshot.boxes.get('boxes', np.zeros((0,7)))
-    labels = snapshot.boxes.get('class_names', np.array([]))
-    cameras_data = snapshot.cameras
+
     
     display_w, display_h = 640, 360
     grid_imgs = []
@@ -382,8 +383,7 @@ if __name__ == "__main__":
     DATA_ROOT = '/mnt/nvme/datasets/pandaset_converted'
     
     dataset = Dataset(DATA_ROOT, preindex_all_sweep_files=True)
-    
-    # Получаем конкретный sweep (например, 0-й)
+
     if len(dataset) > 0:
         for sweep_idx in range(len(dataset)):
             sweep = dataset.get_sweep(sweep_idx)
@@ -395,7 +395,13 @@ if __name__ == "__main__":
                 
                 print(snapshot.lidar.keys())
                 print(snapshot.boxes.keys())
-                img_grid = draw_snapshot(snapshot)
+
+                img_grid = draw_snapshot(
+                    snapshot.lidar['points'],
+                    snapshot.boxes['boxes'],
+                    snapshot.boxes['class_names'],
+                    snapshot.cameras
+                )
                 vis.update(
                 snapshot.lidar['points'],# pts_ego, 
                 snapshot.boxes['boxes'],# snapshot.boxes,# boxes_ego, 
