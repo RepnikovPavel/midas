@@ -8,7 +8,7 @@ from visualizer import LidarVisualizer
 import bisect
 
 # Константа максимальной допустимой разницы во времени (в миллисекундах)
-MAX_TIME_DIFF_MS = 25  # Увеличил до 50, так как в вашем листинге разница была ~50мс
+MAX_TIME_DIFF_MS = 50
 
 class Snapshot:
     """
@@ -188,12 +188,28 @@ class Sweep:
                 
                 best_path = None
                 min_diff = float('inf')
+                best_ts = 0
                 
                 for cand_idx in candidates_idx:
                     diff = abs(cam_ts_list[cand_idx] - ts)
+                    
+                    # Логика обновления лучшего кандидата
+                    update = False
                     if diff < min_diff:
+                        update = True
+                    elif diff == min_diff:
+                        # Если расстояние одинаковое (например, 50мс в обе стороны),
+                        # предпочитаем кадр из прошлого (меньший таймстемп).
+                        # Это исправляет "лаг" боксов.
+                        if cam_ts_list[cand_idx] < best_ts:
+                            update = True
+                        # Если tie-break не сработал, оставляем предыдущий (который мог быть 'future', 
+                        # но в следующем блоке мы это учтем)
+                        
+                    if update:
                         min_diff = diff
                         best_path = cam_paths_list[cand_idx]
+                        best_ts = cam_ts_list[cand_idx]
                 
                 # Проверка порога
                 if best_path is not None and min_diff <= MAX_TIME_DIFF_MS:
@@ -253,6 +269,7 @@ class Dataset:
     
     def __len__(self):
         return len(self.sweep_dirs)
+
 # --- Функция отрисовки ---
 
 def draw_snapshot(snapshot):
@@ -326,12 +343,9 @@ def draw_snapshot(snapshot):
                     corners_ego = (R_yaw @ (dim * corners_unit).T).T + pos
                     corners_cam = (R_mat.T @ (corners_ego - t_vec).T).T
                     
-                    # --- FIX START ---
-                    # Проверяем, что МИНИМАЛЬНАЯ глубина (самая дальняя назад точка) больше порога.
-                    # Если хотя бы одна точка сзади (z < 0.2), пропускаем бокс, чтобы избежать артефактов.
+                    # Проверяем, что МИНИМАЛЬНАЯ глубина больше порога.
                     if corners_cam[:, 2].min() < 0.2:
                         continue
-                    # --- FIX END ---
                     
                     uv_box = (K @ corners_cam.T).T
                     uv_box[:, 0] /= uv_box[:, 2]
@@ -362,7 +376,6 @@ def draw_snapshot(snapshot):
     if len(grid_imgs) >= 6:
         row2 = np.hstack(grid_imgs[3:6])
     else:
-        # Дозаполняем черным если камер меньше 6
         missing = 6 - len(grid_imgs)
         if len(grid_imgs) > 3:
              existing = np.hstack(grid_imgs[3:])
@@ -378,12 +391,10 @@ if __name__ == "__main__":
     vis = LidarVisualizer(title="PandaSet 3D LiDAR")
     cv2.namedWindow("Snapshot View", cv2.WINDOW_NORMAL)
     
-    
     DATA_ROOT = '/mnt/nvme/datasets/pandaset_converted'
     
     dataset = Dataset(DATA_ROOT, preindex_all_sweep_files=True)
     
-    # Получаем конкретный sweep (например, 0-й)
     if len(dataset) > 0:
         for sweep_idx in range(len(dataset)):
             sweep = dataset.get_sweep(sweep_idx)
@@ -393,13 +404,15 @@ if __name__ == "__main__":
             for snapshot_idx in tqdm(range(len(sweep))):
                 snapshot:Snapshot = sweep[snapshot_idx]
                 
-                print(snapshot.lidar.keys())
-                print(snapshot.boxes.keys())
+                # Для отладки можно раскомментировать вывод ключей
+                # print(snapshot.lidar.keys())
+                # print(snapshot.boxes.keys())
+                
                 img_grid = draw_snapshot(snapshot)
                 vis.update(
-                snapshot.lidar['points'],# pts_ego, 
-                snapshot.boxes['boxes'],# snapshot.boxes,# boxes_ego, 
-                None# labels_ego
+                    snapshot.lidar['points'],
+                    snapshot.boxes['boxes'], 
+                    None
                 )
                 vis.process_events()
                 cv2.imshow("Snapshot View", img_grid)
@@ -407,5 +420,4 @@ if __name__ == "__main__":
                 if key == 27:
                     break
                 
-                    
         cv2.destroyAllWindows()

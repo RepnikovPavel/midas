@@ -265,7 +265,8 @@ def convert_sequence(seq_path, output_root):
             if i >= len(cam_data_list): continue
             
             # Таймстемп камеры (используем для имени файла)
-            c_ts = cam_ts[cam][i] if i < len(cam_ts[cam]) else ts
+            # c_ts = cam_ts[cam][i] if i < len(cam_ts[cam]) else ts
+            c_ts = ts
             
             # Картинка
             img_path = os.path.join(camera_root, cam, f"{pkl_file.replace('.pkl', '.jpg')}")
