@@ -280,7 +280,6 @@ def draw_snapshot(
         cam = cameras_data[cam_name]
         img = cam['image'].copy() if cam['image'] is not None else np.zeros((display_h, display_w, 3), dtype=np.uint8)
         
-        # Если есть калибрация и точки
         if cam['K'] is not None and pts_ego.shape[0] > 0:
             K = cam['K']
             t_vec = cam['sensor2ego_translation']
@@ -310,7 +309,6 @@ def draw_snapshot(
                         color = (int(255 * (1 - norm_d)), 0, int(255 * norm_d))
                         cv2.circle(img, (u, v), 1, color, -1)
 
-            # Боксы
             if boxes_ego.shape[0] > 0:
                 corners_unit = np.array([
                     [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
@@ -327,12 +325,8 @@ def draw_snapshot(
                     corners_ego = (R_yaw @ (dim * corners_unit).T).T + pos
                     corners_cam = (R_mat.T @ (corners_ego - t_vec).T).T
                     
-                    # --- FIX START ---
-                    # Проверяем, что МИНИМАЛЬНАЯ глубина (самая дальняя назад точка) больше порога.
-                    # Если хотя бы одна точка сзади (z < 0.2), пропускаем бокс, чтобы избежать артефактов.
                     if corners_cam[:, 2].min() < 0.2:
                         continue
-                    # --- FIX END ---
                     
                     uv_box = (K @ corners_cam.T).T
                     uv_box[:, 0] /= uv_box[:, 2]
