@@ -6,9 +6,162 @@ import transforms3d as t3d
 from tqdm import tqdm
 from visualizer import LidarVisualizer
 import bisect
+import math
+
+# Попытка импорта smopy. Если нет, карта работать не будет, но скрипт не упадет сразу
+try:
+    import smopy
+    SMOpy_AVAILABLE = True
+except ImportError:
+    SMOpy_AVAILABLE = False
+    print("Warning: 'smopy' library not found. Map view will be disabled. Install with: pip install smopy")
 
 # Константа максимальной допустимой разницы во времени (в миллисекундах)
-MAX_TIME_DIFF_MS = 25  # Увеличил до 50, так как в вашем листинге разница была ~50мс
+MAX_TIME_DIFF_MS = 25
+
+# Константы для перевода метров в градусы (приближенные)
+# 1 градус широты ~= 111139 метров
+# 1 градус долготы ~= 111139 * cos(latitude) метров
+METERS_PER_DEG_LAT = 111139.0
+
+class OSMMapVisualizer:
+    def __init__(self, range_meters=102.4, zoom=17):
+        """
+        range_meters: радиус отображения вокруг ego-точки (по умолчанию 102.4м)
+        zoom: уровень зума карты OSM (чем больше, тем детальнее, но медленнее грузится)
+        """
+        self.range_meters = range_meters
+        self.zoom = zoom
+        self.current_map = None
+        self.current_bounds = None # (lat_min, lon_min, lat_max, lon_max)
+        
+        # Порог обновления карты (в метрах), чтобы не грузить тайлы при каждом смещении на 1см
+        self.reload_threshold = 50.0 
+        self.last_center_lat = None
+        self.last_center_lon = None
+
+    def _get_map_bounds(self, lat, lon):
+        """Вычисляет границы карты (lat/lon) вокруг точки."""
+        # Переводим метры в градусы
+        delta_lat = self.range_meters / METERS_PER_DEG_LAT
+        delta_lon = self.range_meters / (METERS_PER_DEG_LAT * math.cos(math.radians(lat)))
+
+        lat_min = lat - delta_lat
+        lat_max = lat + delta_lat
+        lon_min = lon - delta_lon
+        lon_max = lon + delta_lon
+        
+        return lat_min, lon_min, lat_max, lon_max
+
+    def _load_map(self, lat, lon):
+        """Загружает новую карту через smopy."""
+        if not SMOpy_AVAILABLE:
+            return None
+            
+        lat_min, lon_min, lat_max, lon_max = self._get_map_bounds(lat, lon)
+        
+        # Smopy принимает (lat_min, lon_min, lat_max, lon_max)
+        try:
+            # tilesize=512 может дать более красивую картинку, но 256 стандарт
+            smap = smopy.Map(lat_min, lon_min, lat_max, lon_max, z=self.zoom, tilesize=256)
+            
+            # Конвертируем в OpenCV формат (RGB -> BGR)
+            # smap.img_pil это PIL изображение
+            img = np.array(smap.img_pil) 
+            img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+            
+            self.current_map = img
+            self.current_bounds = (lat_min, lon_min, lat_max, lon_max)
+            self.last_center_lat = lat
+            self.last_center_lon = lon
+            return img
+        except Exception as e:
+            print(f"Error loading map: {e}")
+            return None
+
+    def _geo_to_pixel(self, lat, lon):
+        """Переводит lat/lon в пиксели на текущем изображении карты."""
+        if self.current_bounds is None or self.current_map is None:
+            return None, None
+        
+        h, w = self.current_map.shape[:2]
+        lat_min, lon_min, lat_max, lon_max = self.current_bounds
+
+        # Нормализуем координаты
+        # X (lon): от lon_min до lon_max -> от 0 до w
+        # Y (lat): от lat_max до lat_min -> от 0 до h (ось Y в изображении перевернута)
+        
+        x_ratio = (lon - lon_min) / (lon_max - lon_min)
+        y_ratio = (lat_max - lat) / (lat_max - lat_min)
+
+        px = int(x_ratio * w)
+        py = int(y_ratio * h)
+        
+        return px, py
+
+    def update(self, lat, lon, heading_rad=None):
+        """
+        Обновляет отображение карты.
+        lat, lon: координаты ego.
+        heading_rad: курс (yaw) в радианах (опционально).
+        """
+        if not SMOpy_AVAILABLE:
+            return np.zeros((400, 400, 3), dtype=np.uint8)
+
+        # Проверяем, нужно ли перезагружать карту (сильно сдвинулись?)
+        reload_needed = False
+        if self.last_center_lat is None:
+            reload_needed = True
+        else:
+            # Простая проверка дистанции
+            dlat = (lat - self.last_center_lat) * METERS_PER_DEG_LAT
+            dlon = (lon - self.last_center_lon) * (METERS_PER_DEG_LAT * math.cos(math.radians(lat)))
+            dist = math.sqrt(dlat**2 + dlon**2)
+            if dist > self.reload_threshold:
+                reload_needed = True
+
+        if reload_needed:
+            self._load_map(lat, lon)
+        
+        if self.current_map is None:
+            return np.zeros((400, 400, 3), dtype=np.uint8)
+
+        # Копируем карту для рисования
+        vis_map = self.current_map.copy()
+        
+        # Получаем пиксельные координаты ego
+        px, py = self._geo_to_pixel(lat, lon)
+        
+        if px is not None and 0 <= px < vis_map.shape[1] and 0 <= py < vis_map.shape[0]:
+            # Рисуем ego точку (синий круг)
+            cv2.circle(vis_map, (px, py), 5, (255, 0, 0), -1)
+            
+            # Рисуем направление (если есть)
+            if heading_rad is not None:
+                length = 20 # длина стрелки в пикселях
+                # heading обычно считается от севера по часовой? 
+                # В датасетах часто: 0 - Восток (X), pi/2 - Север (Y).
+                # Если в transforms3d используется стандартная логика:
+                # x = cos(yaw), y = sin(yaw)
+                
+                # Для карты (верх = Север):
+                # Если heading = 0 это Восток (X), то стрелка вправо.
+                # Если heading = 0 это Север, то стрелка вверх.
+                # Будем считать, что heading - это угол от оси X (Восток) против часовой.
+                
+                # Конец стрелки
+                # dx = cos(heading), dy = -sin(heading) (ось Y картинки вниз)
+                dx = int(length * math.cos(heading_rad))
+                dy = int(-length * math.sin(heading_rad))
+                
+                cv2.arrowedLine(vis_map, (px, py), (px + dx, py + dy), (0, 0, 255), 2, tipLength=0.3)
+
+        # Добавим текст с координатами
+        cv2.putText(vis_map, f"Lat: {lat:.6f}", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+        cv2.putText(vis_map, f"Lon: {lon:.6f}", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,0), 1)
+
+        return vis_map
+
 
 class Snapshot:
     """
@@ -263,8 +416,6 @@ def draw_snapshot(
     """
     Отрисовка снэпшота. Принимает объект Snapshot.
     """
-
-    
     display_w, display_h = 640, 360
     grid_imgs = []
     
@@ -286,7 +437,6 @@ def draw_snapshot(
             q_vec = cam['sensor2ego_rotation'] # w, x, y, z
             
             # Трансформация из Ego в Cam
-            # sensor2ego: P_ego = R * P_cam + t  =>  P_cam = R.T * (P_ego - t)
             R_mat = t3d.quaternions.quat2mat(q_vec)
             
             # Точки
@@ -372,7 +522,10 @@ def draw_snapshot(
 if __name__ == "__main__":
     vis = LidarVisualizer(title="PandaSet 3D LiDAR")
     cv2.namedWindow("Snapshot View", cv2.WINDOW_NORMAL)
+    cv2.namedWindow("OSM Map", cv2.WINDOW_NORMAL)
     
+    # Инициализируем визуализатор карты
+    map_vis = OSMMapVisualizer(range_meters=102.4, zoom=17)
     
     DATA_ROOT = '/mnt/nvme/datasets/pandaset_converted'
     
@@ -387,20 +540,52 @@ if __name__ == "__main__":
             for snapshot_idx in tqdm(range(len(sweep))):
                 snapshot:Snapshot = sweep[snapshot_idx]
                 
-                print(snapshot.gps)
+                # Данные для лидара/боксов
+                lidar_data = snapshot.lidar
+                boxes_data = snapshot.boxes
+                gps_data = snapshot.gps
+                
+                # Отрисовка камер
                 img_grid = draw_snapshot(
-                    snapshot.lidar['points'],
-                    snapshot.boxes['boxes'],
-                    snapshot.boxes['class_names'],
+                    lidar_data.get('points', np.zeros((0,3))),
+                    boxes_data.get('boxes', np.zeros((0,7))),
+                    boxes_data.get('class_names', []),
                     snapshot.cameras
                 )
+                
+                # Отрисовка карты
+                map_img = np.zeros((400, 400, 3), dtype=np.uint8)
+                if gps_data:
+                    lat = gps_data['lat']
+                    lon = gps_data['long']
+                    
+                    # Вычисляем курс (yaw) из rotation
+                    heading = None
+                    if 'ego2global_rotation' in lidar_data:
+                        q = lidar_data['ego2global_rotation'] # w, x, y, z
+                        # Преобразование кватерниона в Euler angles
+                        # t3d возвращает (roll, pitch, yaw) или зависит от последовательности?
+                        # Обычно quat2euler возвращает (ai, aj, ak) где 'sxyz' по умолчанию.
+                        # Для получения yaw (heading) вокруг Z:
+                        euler = t3d.euler.quat2euler(q, axes='sxyz')
+                        # euler возвращает (x, y, z) углы?
+                        # t3d.euler.quat2euler возвращает углы в радианах.
+                        # Порядок осей 'sxyz' -> вращения вокруг x, y, z.
+                        # Z - ось вверх. Третий элемент - это Yaw.
+                        heading = euler[2] 
+                        
+                    map_img = map_vis.update(lat, lon, heading)
+                
                 vis.update(
-                snapshot.lidar['points'],# pts_ego, 
-                snapshot.boxes['boxes'],# snapshot.boxes,# boxes_ego, 
-                None# labels_ego
+                    lidar_data.get('points', np.zeros((0,3))), 
+                    boxes_data.get('boxes', np.zeros((0,7))), 
+                    None
                 )
                 vis.process_events()
+                
                 cv2.imshow("Snapshot View", img_grid)
+                cv2.imshow("OSM Map", map_img)
+                
                 key = cv2.waitKey(1)
                 if key == 27:
                     break
