@@ -372,34 +372,36 @@ def draw_snapshot(snapshot):
 
 if __name__ == "__main__":
     vis = LidarVisualizer(title="PandaSet 3D LiDAR")
+    cv2.namedWindow("Snapshot View", cv2.WINDOW_NORMAL)
+    
+    
     DATA_ROOT = '/mnt/nvme/datasets/pandaset_converted'
     
     dataset = Dataset(DATA_ROOT, preindex_all_sweep_files=True)
     
     # Получаем конкретный sweep (например, 0-й)
     if len(dataset) > 0:
-        sweep = dataset.get_sweep(0)
-        
-        print(f"Processing Sweep with {len(sweep)} frames...")
-        
-        cv2.namedWindow("Snapshot View", cv2.WINDOW_NORMAL)
-        
-        for snapshot_idx in tqdm(range(len(sweep))):
-            snapshot:Snapshot = sweep[snapshot_idx]
+        for sweep_idx in range(len(dataset)):
+            sweep = dataset.get_sweep(sweep_idx)
             
-            print(snapshot.lidar.keys())
-            print(snapshot.boxes.keys())
-            img_grid = draw_snapshot(snapshot)
-            vis.update(
-            snapshot.lidar['points'],# pts_ego, 
-            snapshot.boxes['boxes'],# snapshot.boxes,# boxes_ego, 
-            None# labels_ego
-            )
-            vis.process_events()
-            cv2.imshow("Snapshot View", img_grid)
-            key = cv2.waitKey(1)
-            if key == 27:
-                break
+            print(f"Processing Sweep with {len(sweep)} frames...")
             
+            for snapshot_idx in tqdm(range(len(sweep))):
+                snapshot:Snapshot = sweep[snapshot_idx]
                 
+                print(snapshot.lidar.keys())
+                print(snapshot.boxes.keys())
+                img_grid = draw_snapshot(snapshot)
+                vis.update(
+                snapshot.lidar['points'],# pts_ego, 
+                snapshot.boxes['boxes'],# snapshot.boxes,# boxes_ego, 
+                None# labels_ego
+                )
+                vis.process_events()
+                cv2.imshow("Snapshot View", img_grid)
+                key = cv2.waitKey(1)
+                if key == 27:
+                    break
+                
+                    
         cv2.destroyAllWindows()
