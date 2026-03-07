@@ -2,6 +2,102 @@ import numpy as np
 from vispy import app, scene
 from vispy.scene import visuals
 from vispy.color import Colormap
+import numba
+
+# --- Numba-optimized geometry calculations ---
+
+@numba.njit
+def calculate_box_lines(boxes):
+    """
+    Вычисляет вершины линий для всех боксов одним массивом.
+    Возвращает массив формы (N * 24, 3).
+    """
+    n_boxes = boxes.shape[0]
+    # 12 ребер * 2 точки на ребро = 24 вершины
+    n_verts = n_boxes * 24
+    lines = np.empty((n_verts, 3), dtype=np.float32)
+    
+    # Индексы ребер для куба с центром в (0,0,0) и размером 1
+    # (соответствует логике self.edges)
+    edges = np.array([
+        [0, 1], [1, 2], [2, 3], [3, 0], # Нижняя грань
+        [4, 5], [5, 6], [6, 7], [7, 4], # Верхняя грань
+        [0, 4], [1, 5], [2, 6], [3, 7]  # Боковые ребра
+    ])
+    
+    # Локальные координаты углов единичного куба (от -0.5 до 0.5)
+    corners_unit = np.array([
+        [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
+        [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5], [0.5, 0.5,  0.5], [-0.5, 0.5,  0.5]
+    ])
+
+    for i in range(n_boxes):
+        x, y, z, dx, dy, dz, yaw = boxes[i]
+        
+        # Матрица поворота
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+        
+        # Вычисляем 8 углов реального бокса
+        # Сначала масштабируем единичный куб, потом поворачиваем, потом сдвигаем
+        corners = np.empty((8, 3))
+        for j in range(8):
+            # Масштабирование
+            lx = corners_unit[j, 0] * dx
+            ly = corners_unit[j, 1] * dy
+            lz = corners_unit[j, 2] * dz
+            
+            # Поворот и сдвиг
+            corners[j, 0] = c * lx - s * ly + x
+            corners[j, 1] = s * lx + c * ly + y
+            corners[j, 2] = lz + z
+            
+        # Заполняем вершины линий для текущего бокса
+        base_idx = i * 24
+        for k in range(12):
+            p1_idx = edges[k, 0]
+            p2_idx = edges[k, 1]
+            
+            # Точка начала ребра
+            lines[base_idx + k*2, 0] = corners[p1_idx, 0]
+            lines[base_idx + k*2, 1] = corners[p1_idx, 1]
+            lines[base_idx + k*2, 2] = corners[p1_idx, 2]
+            
+            # Точка конца ребра
+            lines[base_idx + k*2 + 1, 0] = corners[p2_idx, 0]
+            lines[base_idx + k*2 + 1, 1] = corners[p2_idx, 1]
+            lines[base_idx + k*2 + 1, 2] = corners[p2_idx, 2]
+            
+    return lines
+
+@numba.njit
+def calculate_arrows(boxes):
+    """
+    Вычисляет вершины линий для стрелок направления.
+    Возвращает массив формы (N * 2, 3).
+    """
+    n_boxes = boxes.shape[0]
+    arrows = np.empty((n_boxes * 2, 3), dtype=np.float32)
+    
+    for i in range(n_boxes):
+        x, y, z, dx, dy, dz, yaw = boxes[i]
+        
+        half_l = dx / 2.0
+        c = np.cos(yaw)
+        s = np.sin(yaw)
+        
+        # Центр
+        arrows[i*2, 0] = x
+        arrows[i*2, 1] = y
+        arrows[i*2, 2] = z
+        
+        # Передняя точка
+        arrows[i*2 + 1, 0] = x + half_l * c
+        arrows[i*2 + 1, 1] = y + half_l * s
+        arrows[i*2 + 1, 2] = z
+        
+    return arrows
+
 
 class LidarVisualizer:
     def __init__(self, title="LiDAR 3D View"):
@@ -23,94 +119,86 @@ class LidarVisualizer:
         
         self.cmap = Colormap(['blue', 'cyan', 'green', 'yellow', 'red'])
 
-        # Оптимизация: предвычисление геометрии куба
-        self.corners_unit = np.array([
-            [-0.5, -0.5, -0.5], [0.5, -0.5, -0.5], [0.5, 0.5, -0.5], [-0.5, 0.5, -0.5],
-            [-0.5, -0.5,  0.5], [0.5, -0.5,  0.5], [0.5, 0.5,  0.5], [-0.5, 0.5,  0.5]
-        ])
-        self.edges = [
-            [0, 1], [1, 2], [2, 3], [3, 0],
-            [4, 5], [5, 6], [6, 7], [7, 4],
-            [0, 4], [1, 5], [2, 6], [3, 7]
-        ]
-
     def process_events(self):
-        """
-        Неблокирующий метод обновления GUI.
-        Нужно вызывать в каждом шаге цикла после update().
-        """
         app.process_events()
 
-    def update(self, points, boxes=None, labels=None):
+    def update(self, data_list):
+        """
+        Обновляет визуализацию на основе списка словарей.
+        
+        Args:
+            data_list (list): Список словарей с ключами:
+                - 'plot_type': 'points' или 'boxes'
+                - 'data': np.ndarray (N, 3) для точек или (N, 7) для боксов
+                - 'colors': (опционально) np.ndarray uint8 RGB
+        """
+        points_accum = []
+        points_colors_accum = []
+        
+        boxes_accum = []
+        boxes_colors_accum = []
+
+        for item in data_list:
+            plot_type = item.get('plot_type')
+            data = item.get('data')
+            colors = item.get('colors')
+            
+            if data is None or data.shape[0] == 0:
+                continue
+
+            if plot_type == 'points':
+                points_accum.append(data)
+                
+                if colors is not None:
+                    # Конвертация uint8 RGB (0-255) в float RGBA (0-1)
+                    c = colors.astype(np.float32) / 255.0
+                    # Добавляем альфа-канал
+                    c_rgba = np.hstack((c, np.ones((c.shape[0], 1), dtype=np.float32)))
+                    points_colors_accum.append(c_rgba)
+                else:
+                    # Используем карту высот (Z-gradient)
+                    z_vals = data[:, 2]
+                    z_min, z_max = -3.0, 3.0
+                    z_norm = (z_vals - z_min) / (z_max - z_min)
+                    z_norm = np.clip(z_norm, 0, 1)
+                    points_colors_accum.append(self.cmap.map(z_norm))
+
+            elif plot_type == 'boxes':
+                boxes_accum.append(data)
+                
+                if colors is not None:
+                    c = colors.astype(np.float32) / 255.0
+                    c_rgba = np.hstack((c, np.ones((c.shape[0], 1), dtype=np.float32)))
+                    boxes_colors_accum.append(c_rgba)
+                else:
+                    # Дефолтный зеленый цвет для всех боксов в пачке
+                    # (N, 4)
+                    default_box_color = np.tile(np.array([[0, 1, 0, 0.8]], dtype=np.float32), (data.shape[0], 1))
+                    boxes_colors_accum.append(default_box_color)
+
         # --- Отрисовка точек ---
-        if points.shape[0] > 0:
-            z_vals = points[:, 2]
-            z_min, z_max = -3.0, 3.0
-            z_norm = (z_vals - z_min) / (z_max - z_min)
-            z_norm = np.clip(z_norm, 0, 1)
-            colors = self.cmap.map(z_norm)
-            self.scatter.set_data(points, face_color=colors, edge_color=None, size=2, edge_width=0)
+        if len(points_accum) > 0:
+            all_points = np.vstack(points_accum)
+            all_point_colors = np.vstack(points_colors_accum)
+            self.scatter.set_data(all_points, face_color=all_point_colors, edge_color=None, size=2, edge_width=0)
         else:
             self.scatter.set_data(np.zeros((0, 3)))
 
-        if boxes is not None and boxes.shape[0] > 0:
-            # Отрисовка граней боксов
-            line_data = self._process_boxes_for_vis(boxes)
-            if line_data.shape[0] > 0:
-                self.lines.set_data(line_data, color=(0, 1, 0, 0.8))
+        # --- Отрисовка боксов ---
+        if len(boxes_accum) > 0:
+            all_boxes = np.vstack(boxes_accum)
             
-            # Отрисовка стрелок направления
-            arrow_data = self._process_arrows_for_vis(boxes)
-            if arrow_data.shape[0] > 0:
-                self.arrows.set_data(arrow_data, color=(1, 0, 0, 0.9))
+            # Вычисляем геометрию через Numba
+            line_pos = calculate_box_lines(all_boxes)
+            arrow_pos = calculate_arrows(all_boxes)
+            
+            # Подготовка цветов для линий
+            # Нам нужно повторить цвет каждого бокса для 24 вершин линий
+            all_box_colors = np.vstack(boxes_colors_accum)
+            line_colors = np.repeat(all_box_colors, 24, axis=0)
+            
+            self.lines.set_data(line_pos, color=line_colors)
+            self.arrows.set_data(arrow_pos, color='red') # Стрелки оставляем красными для контраста
         else:
             self.lines.set_data(np.zeros((0, 3)))
             self.arrows.set_data(np.zeros((0, 3)))
-
-    def _process_boxes_for_vis(self, boxes):
-        """Оптимированная генерация линий для боксов."""
-        N = boxes.shape[0]
-        # Результирующий массив: N боксов * 12 ребер * 2 точки
-        all_lines = np.zeros((N * len(self.edges), 2, 3))
-        
-        for i in range(N):
-            x, y, z, dx, dy, dz, yaw = boxes[i]
-            pos = np.array([x, y, z])
-            dim = np.array([dx, dy, dz])
-            c, s = np.cos(yaw), np.sin(yaw)
-            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-            
-            # Вычисляем углы
-            corners = (R @ (dim * self.corners_unit).T).T + pos
-            
-            # Заполняем линии для текущего бокса
-            for j, (start_idx, end_idx) in enumerate(self.edges):
-                all_lines[i * len(self.edges) + j, 0] = corners[start_idx]
-                all_lines[i * len(self.edges) + j, 1] = corners[end_idx]
-        
-        # Reshape для формата vispy (N*24, 3)
-        return all_lines.reshape(-1, 3)
-
-    def _process_arrows_for_vis(self, boxes):
-        """Создает линии для отображения направления (стрелок)."""
-        N = boxes.shape[0]
-        arrow_segments = np.zeros((N * 2, 3)) # 2 точки на бокс (начало и конец)
-        
-        for i in range(N):
-            x, y, z, dx, dy, dz, yaw = boxes[i]
-            
-            # Центр бокса
-            start_point = np.array([x, y, z])
-            
-            # Вектор направления (передняя грань)
-            half_length = dx / 2.0
-            dir_x = half_length * np.cos(yaw)
-            dir_y = half_length * np.sin(yaw)
-            
-            end_point = np.array([x + dir_x, y + dir_y, z])
-            
-            # Vispy Line с connect='segments' ожидает пары точек подряд
-            arrow_segments[i*2] = start_point
-            arrow_segments[i*2 + 1] = end_point
-            
-        return arrow_segments

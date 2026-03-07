@@ -1,0 +1,12 @@
+[submodule "cuml"]
+	path = cuml
+	url = https://github.com/RepnikovPavel/cuml.git
+[submodule "rmm"]
+	path = rmm
+	url = https://github.com/RepnikovPavel/rmm.git
+[submodule "raft"]
+	path = raft
+	url = https://github.com/RepnikovPavel/raft.git
+[submodule "cuvs"]
+	path = cuvs
+	url = https://github.com/RepnikovPavel/cuvs.git
