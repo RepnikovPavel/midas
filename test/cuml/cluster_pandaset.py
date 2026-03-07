@@ -75,8 +75,6 @@ def get_cluster_colors_rgb(labels: np.ndarray) -> np.ndarray:
 
 if __name__ == "__main__":
     vis = LidarVisualizer(title="PandaSet 3D LiDAR")
-    cv2.namedWindow("Snapshot View", cv2.WINDOW_NORMAL)
-    
     
     DATA_ROOT = '/mnt/nvme/datasets/pandaset_converted'
     
@@ -90,6 +88,7 @@ if __name__ == "__main__":
             for snapshot_idx in tqdm(range(len(sweep))):
                 snapshot:Snapshot = sweep[snapshot_idx]
                 pts_ego = snapshot.lidar['points']
+                print(f"pts shape {pts_ego.shape}")
                 boxes_3d_ego = snapshot.boxes['boxes']
                 cudf_ = cudf.DataFrame()
                 cudf_['x'] = pts_ego[:,0]
