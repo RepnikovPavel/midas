@@ -244,9 +244,6 @@ def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_v
 @njit
 def update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr, flatness_thr_arr, 
                            sensor_height_arr, max_elevation_storage, max_flatness_storage):
-    """
-    Обновление порогов внутри Numba. Модифицирует массивы in-place.
-    """
     # Update Elevation
     for i in range(len(update_elevation)):
         if len(update_elevation[i]) == 0: continue
@@ -261,7 +258,6 @@ def update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr,
             
         exceed_num = len(update_elevation[i]) - max_elevation_storage
         if exceed_num > 0:
-            # Удаление элементов из начала списка (FIFO)
             for _ in range(exceed_num):
                 update_elevation[i].pop(0)
                 
@@ -280,9 +276,6 @@ def update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr,
 @njit
 def ground_filter_core_stateful(pts, params_tuple, update_elevation, update_flatness, 
                                 elevation_thr_arr, flatness_thr_arr, sensor_height_arr):
-    """
-    Основная функция фильтрации. Принимает изменяемые массивы состояния.
-    """
     (verbose, enable_RNR, enable_RVPF, enable_TGR, num_iter, num_lpr, num_min_pts, 
      num_zones, num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr, 
      sensor_height_init, th_seeds, th_dist, th_seeds_v, th_dist_v, max_range, min_range, 
@@ -295,7 +288,6 @@ def ground_filter_core_stateful(pts, params_tuple, update_elevation, update_flat
     semantic = np.empty(n_pts, dtype=np.int32)
     semantic.fill(1) 
 
-    # Используем текущее значение sensor_height из массива состояния
     current_sensor_height = sensor_height_arr[0]
 
     # RNR
@@ -457,14 +449,13 @@ def ground_filter_core_stateful(pts, params_tuple, update_elevation, update_flat
             
             concentric_idx += 1
             
-    # Обновление порогов (A-GLE)
     update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr, flatness_thr_arr, 
                            sensor_height_arr, max_elevation_storage, max_flatness_storage)
             
     return semantic
 
 # --------------------------------------------------------------------------------
-# Python Wrapper Class
+# Python Wrapper Class (Stateful)
 # --------------------------------------------------------------------------------
 
 class PatchWorkpp:
@@ -501,22 +492,18 @@ class PatchWorkpp:
         self.max_flatness_storage = params.get('max_flatness_storage', 1000)
         self.max_elevation_storage = params.get('max_elevation_storage', 1000)
         
-        # Инициализация состояния
-        # Используем typed.List для истории, чтобы Numba могли их менять in-place
+        # STATE INITIALIZATION
         self.update_elevation_ = typed.List()
         self.update_flatness_ = typed.List()
         for _ in range(4):
             self.update_elevation_.append(typed.List.empty_list(float64))
             self.update_flatness_.append(typed.List.empty_list(float64))
         
-        # Пороги (массивы numpy, изменяются in-place)
         self.elevation_thr = np.array(params.get('elevation_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         self.flatness_thr = np.array(params.get('flatness_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         
-        # Sensor height храним в массиве размера 1, чтобы Numba мог менять значение
         self.sensor_height_ = np.array([self.initial_sensor_height], dtype=np.float64)
         
-        # Pre-calc ranges
         min_range_z2 = (7 * self.min_range + self.max_range) / 8.0
         min_range_z3 = (3 * self.min_range + self.max_range) / 4.0
         min_range_z4 = (self.min_range + self.max_range) / 2.0
@@ -541,33 +528,23 @@ class PatchWorkpp:
         return self.sensor_height_[0]
 
     def forward(self, cloud_in, verbose=False):
-        """
-        Основной метод. Принимает облако точек (N, 3) или (N, 4).
-        Возвращает semantic labels.
-        """
-        # 1. Обработка входных данных
         pts = cloud_in.astype(np.float64)
         
-        # Если передали только xyz, добавляем колонку интенсивности (0)
         if pts.shape[1] == 3:
             temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float64)
             temp_pts[:, :3] = pts
             pts = temp_pts
-        elif pts.shape[1] == 4:
-            pts = pts # OK
-        else:
+        elif pts.shape[1] != 4:
              raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
 
-        # Валидация (NaN/Inf)
         valid_mask = np.isfinite(pts).all(axis=1)
         clean_pts = pts[valid_mask]
         
-        # 2. Формирование кортежа параметров (immutable part)
         params_tuple = (
             self.verbose, self.enable_RNR, self.enable_RVPF, self.enable_TGR,
             self.num_iter, self.num_lpr, self.num_min_pts, self.num_zones,
             self.num_rings_of_interest, self.RNR_ver_angle_thr, self.RNR_intensity_thr,
-            self.initial_sensor_height, # передаем начальный, но внутри используется self.sensor_height_
+            self.initial_sensor_height,
             self.th_seeds, self.th_dist, self.th_seeds_v, self.th_dist_v,
             self.max_range, self.min_range, self.uprightness_thr,
             self.adaptive_seed_selection_margin, self.intensity_thr,
@@ -576,19 +553,17 @@ class PatchWorkpp:
             self.min_ranges, self.ring_sizes, self.sector_sizes
         )
         
-        # 3. Вызов ядра
         semantic = ground_filter_core_stateful(
             clean_pts, params_tuple, 
             self.update_elevation_, self.update_flatness_, 
             self.elevation_thr, self.flatness_thr, self.sensor_height_
         )
+        
         if verbose:
             print(f"PatchWork++ State Update sensor_height: {self.sensor_height_[0]:.4f}")
             print(f"PatchWork++ State Update elevation_thr: {self.elevation_thr}")
             print(f"PatchWork++ State Update flatness_thr:  {self.flatness_thr}")
 
-
-        # 4. Восстановление полного массива меток
         full_semantic = np.empty(len(pts), dtype=np.int32)
         full_semantic.fill(1)
         full_semantic[valid_mask] = semantic
@@ -596,7 +571,7 @@ class PatchWorkpp:
         return full_semantic
 
 # --------------------------------------------------------------------------------
-# Convenience Function (остается для совместимости, но создает временный инстанс)
+# Stateless Function Interface
 # --------------------------------------------------------------------------------
 
 def GroundFilterForward(
@@ -629,41 +604,84 @@ def GroundFilterForward(
     max_flatness_storage=1000,
     max_elevation_storage=1000
 ):
+    # 1. Defaults
     if num_sectors_each_zone is None: num_sectors_each_zone = [16, 32, 54, 32]
     if num_rings_each_zone is None: num_rings_each_zone = [2, 4, 4, 4]
     if elevation_thr is None: elevation_thr = [0.0, 0.0, 0.0, 0.0]
     if flatness_thr is None: flatness_thr = [0.0, 0.0, 0.0, 0.0]
 
-    params = {
-        'verbose': verbose,
-        'enable_RNR': enable_RNR,
-        'enable_RVPF': enable_RVPF,
-        'enable_TGR': enable_TGR,
-        'num_iter': num_iter,
-        'num_lpr': num_lpr,
-        'num_min_pts': num_min_pts,
-        'num_zones': num_zones,
-        'num_rings_of_interest': num_rings_of_interest,
-        'RNR_ver_angle_thr': RNR_ver_angle_thr,
-        'RNR_intensity_thr': RNR_intensity_thr,
-        'sensor_height': sensor_height,
-        'th_seeds': th_seeds,
-        'th_dist': th_dist,
-        'th_seeds_v': th_seeds_v,
-        'th_dist_v': th_dist_v,
-        'max_range': max_range,
-        'min_range': min_range,
-        'uprightness_thr': uprightness_thr,
-        'adaptive_seed_selection_margin': adaptive_seed_selection_margin,
-        'intensity_thr': intensity_thr,
-        'num_sectors_each_zone': num_sectors_each_zone,
-        'num_rings_each_zone': num_rings_each_zone,
-        'elevation_thr': elevation_thr,
-        'flatness_thr': flatness_thr,
-        'max_flatness_storage': max_flatness_storage,
-        'max_elevation_storage': max_elevation_storage
-    }
+    # 2. Input processing
+    pts = pts.astype(np.float64)
+    if pts.shape[1] == 3:
+        temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float64)
+        temp_pts[:, :3] = pts
+        pts = temp_pts
+    elif pts.shape[1] != 4:
+         raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
+
+    valid_mask = np.isfinite(pts).all(axis=1)
+    clean_pts = pts[valid_mask]
+
+    # 3. Initialize Temp State (Stateless behavior)
+    # Create fresh lists for this call
+    update_elevation = typed.List()
+    update_flatness = typed.List()
+    for _ in range(4):
+        update_elevation.append(typed.List.empty_list(float64))
+        update_flatness.append(typed.List.empty_list(float64))
     
-    # Создаем временный объект
-    pw = PatchWorkpp(params)
-    return pw.forward(pts)
+    # Arrays for thresholds (copies to avoid modifying inputs)
+    elevation_thr_arr = np.array(elevation_thr, dtype=np.float64)
+    flatness_thr_arr = np.array(flatness_thr, dtype=np.float64)
+    sensor_height_arr = np.array([sensor_height], dtype=np.float64)
+    
+    # Pre-calc geometry
+    num_sectors_each_zone_np = np.array(num_sectors_each_zone, dtype=np.int64)
+    num_rings_each_zone_np = np.array(num_rings_each_zone, dtype=np.int64)
+    
+    min_range_z2 = (7 * min_range + max_range) / 8.0
+    min_range_z3 = (3 * min_range + max_range) / 4.0
+    min_range_z4 = (min_range + max_range) / 2.0
+    min_ranges = np.array([min_range, min_range_z2, min_range_z3, min_range_z4], dtype=np.float64)
+    
+    ring_sizes = np.array([
+        (min_range_z2 - min_range) / num_rings_each_zone_np[0],
+        (min_range_z3 - min_range_z2) / num_rings_each_zone_np[1],
+        (min_range_z4 - min_range_z3) / num_rings_each_zone_np[2],
+        (max_range - min_range_z4) / num_rings_each_zone_np[3]
+    ], dtype=np.float64)
+    
+    sector_sizes = np.array([
+        2 * math.pi / num_sectors_each_zone_np[0],
+        2 * math.pi / num_sectors_each_zone_np[1],
+        2 * math.pi / num_sectors_each_zone_np[2],
+        2 * math.pi / num_sectors_each_zone_np[3]
+    ], dtype=np.float64)
+
+    # 4. Params Tuple
+    params_tuple = (
+        verbose, enable_RNR, enable_RVPF, enable_TGR,
+        num_iter, num_lpr, num_min_pts, num_zones,
+        num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr,
+        sensor_height, # initial
+        th_seeds, th_dist, th_seeds_v, th_dist_v,
+        max_range, min_range, uprightness_thr,
+        adaptive_seed_selection_margin, intensity_thr,
+        num_sectors_each_zone_np, num_rings_each_zone_np,
+        max_flatness_storage, max_elevation_storage,
+        min_ranges, ring_sizes, sector_sizes
+    )
+
+    # 5. Core Execution
+    semantic = ground_filter_core_stateful(
+        clean_pts, params_tuple, 
+        update_elevation, update_flatness, 
+        elevation_thr_arr, flatness_thr_arr, sensor_height_arr
+    )
+    
+    # 6. Output
+    full_semantic = np.empty(len(pts), dtype=np.int32)
+    full_semantic.fill(1)
+    full_semantic[valid_mask] = semantic
+    
+    return full_semantic
