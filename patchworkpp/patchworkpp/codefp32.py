@@ -39,6 +39,84 @@ def calc_mean_stdev_fp32(vec):
     return mean, stdev
 
 @njit
+def eigen_3x3_symmetric_fp32(A):
+    # Jacobi Eigenvalue Algorithm for 3x3 symmetric matrices
+    # Works in-place on a copy to avoid modifying input
+    D = A.copy()
+    V = np.eye(3, dtype=np.float32)
+    
+    # Iterate until convergence (standard Jacobi rotation)
+    # For 3x3, usually converges very quickly (< 10 iterations)
+    for _ in range(10):
+        # Find largest off-diagonal element
+        p, q = 0, 1
+        max_val = abs(D[0, 1])
+        
+        if abs(D[0, 2]) > max_val:
+            p, q = 0, 2
+            max_val = abs(D[0, 2])
+        if abs(D[1, 2]) > max_val:
+            p, q = 1, 2
+            max_val = abs(D[1, 2])
+            
+        if max_val < 1e-7: # Convergence threshold for float32
+            break
+            
+        # Compute rotation angle
+        # theta = 0.5 * atan2(2 * D[p,q], D[q,q] - D[p,p])
+        diff = D[q, q] - D[p, p]
+        if abs(diff) < 1e-10:
+            theta = math.pi / 4.0
+            if D[p, q] < 0:
+                theta = -theta
+        else:
+            theta = 0.5 * math.atan2(2.0 * D[p, q], diff)
+            
+        c = math.cos(theta)
+        s = math.sin(theta)
+        
+        # Apply Jacobi rotation to D (D = R^T * D * R)
+        # Updating only the affected rows/cols
+        for i in range(3):
+            dip = D[i, p]
+            diq = D[i, q]
+            D[i, p] = c * dip - s * diq
+            D[i, q] = s * dip + c * diq
+            
+        for i in range(3):
+            dpi = D[p, i]
+            dqi = D[q, i]
+            D[p, i] = c * dpi - s * dqi
+            D[q, i] = s * dpi + c * dqi
+            
+        # Update Eigenvector matrix V (V = V * R)
+        for i in range(3):
+            vip = V[i, p]
+            viq = V[i, q]
+            V[i, p] = c * vip - s * viq
+            V[i, q] = s * vip + c * viq
+            
+    S = np.array([D[0, 0], D[1, 1], D[2, 2]], dtype=np.float32)
+    
+    # Sort eigenvalues descending (S[0] >= S[1] >= S[2])
+    # Standard SVD returns descending order, logic relies on S[2] being smallest (flatness)
+    
+    # Bubble sort for 3 elements
+    if S[0] < S[1]:
+        S[0], S[1] = S[1], S[0]
+        for i in range(3): V[i, 0], V[i, 1] = V[i, 1], V[i, 0]
+        
+    if S[0] < S[2]:
+        S[0], S[2] = S[2], S[0]
+        for i in range(3): V[i, 0], V[i, 2] = V[i, 2], V[i, 0]
+        
+    if S[1] < S[2]:
+        S[1], S[2] = S[2], S[1]
+        for i in range(3): V[i, 1], V[i, 2] = V[i, 2], V[i, 1]
+        
+    return V, S
+
+@njit
 def estimate_plane_fp32(points):
     n_pts = points.shape[0]
     if n_pts == 0:
@@ -57,8 +135,10 @@ def estimate_plane_fp32(points):
     if n_pts > 1:
         cov /= (n_pts - 1)
     
-    U, S, Vt = np.linalg.svd(cov)
+    # Custom SVD / Eigenvalue decomposition replacement
+    U, S = eigen_3x3_symmetric_fp32(cov)
     
+    # Normal is the eigenvector corresponding to the smallest eigenvalue (last column)
     normal = U[:, 2]
     
     if normal[2] < 0:
