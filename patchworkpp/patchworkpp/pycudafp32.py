@@ -588,4 +588,3 @@ class PatchWorkpp_fp32_light_pycuda:
 def GroundFilterForward_fp32_light_pycuda(pts, **kwargs):
     gf = PatchWorkpp_fp32_light_pycuda(kwargs)
     return gf.forward(pts, verbose=kwargs.get('verbose', False))
-

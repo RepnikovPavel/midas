@@ -1,3 +1,5 @@
+pip install torch torchvision --index-url https://download.pytorch.org/whl/cu129 --force-reinstall
+
 pip install \
     --extra-index-url=https://pypi.nvidia.com --force-reinstall \
     "cudf-cu12==26.2.*" "dask-cudf-cu12==26.2.*" "cuml-cu12==26.2.*" \
@@ -5,4 +7,3 @@ pip install \
     "cucim-cu12==26.2.*" "pylibraft-cu12==26.2.*" "raft-dask-cu12==26.2.*" \
     "cuvs-cu12==26.2.*" "nx-cugraph-cu12==26.2.*"
 
-pip install torch torchvision --index-url https://download.pytorch.org/whl/cu129 --force-reinstall

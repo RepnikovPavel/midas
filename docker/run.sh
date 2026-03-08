@@ -11,7 +11,7 @@ fi
 
 MOUNT_PATH=$1
  
-IMG_NAME=torchcu124:latest
+IMG_NAME=torchcu129:latest
 CONTAINER_NAME=midascontainer
 
 xhost +local:docker
