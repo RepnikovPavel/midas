@@ -1,5 +1,5 @@
 import numpy as np
-from numba import njit, typed, types, float64, int64, boolean, void
+from numba import njit, typed, types, float64, int64
 import math
 
 # --------------------------------------------------------------------------------
@@ -40,22 +40,15 @@ def calc_mean_stdev(vec):
 
 @njit
 def estimate_plane(points):
-    """
-    Оценка плоскости через PCA (SVD).
-    points: (N, 4) массив, где columns 0,1,2 - x,y,z. Column 3 - idx.
-    Возвращает: normal, d, singular_values, pc_mean
-    """
     n_pts = points.shape[0]
     if n_pts == 0:
         return np.zeros(3, dtype=np.float64), 0.0, np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
 
-    # 1. Вычисление среднего (центроида)
     pc_mean = np.zeros(3, dtype=np.float64)
     for i in range(n_pts):
         pc_mean += points[i, :3]
     pc_mean /= n_pts
     
-    # 2. Вычисление ковариационной матрицы
     cov = np.zeros((3, 3), dtype=np.float64)
     for i in range(n_pts):
         p = points[i, :3] - pc_mean
@@ -64,17 +57,13 @@ def estimate_plane(points):
     if n_pts > 1:
         cov /= (n_pts - 1)
     
-    # 3. SVD
     U, S, Vt = np.linalg.svd(cov)
     
-    # Нормаль - это последний столбец U
     normal = U[:, 2]
     
-    # Ориентация нормали
     if normal[2] < 0:
         normal = -normal
         
-    # d = -normal . pc_mean
     d = -np.sum(normal * pc_mean)
     
     return normal, d, S, pc_mean
@@ -126,7 +115,6 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
     for i in range(src.shape[0]):
         current_src_list.append(src[i])
         
-    # R-VPF
     if enable_RVPF:
         for _ in range(num_iter):
             if len(current_src_list) == 0:
@@ -160,7 +148,6 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
             else:
                 break
     
-    # R-GPF
     if len(current_src_list) == 0:
         dst_arr = np.zeros((0, 4), dtype=np.float64)
         non_ground_arr = np.zeros((len(non_ground_dst_list), 4), dtype=np.float64)
@@ -255,12 +242,52 @@ def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_v
     return revert_indices
 
 @njit
-def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatness_lists):
+def update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr, flatness_thr_arr, 
+                           sensor_height_arr, max_elevation_storage, max_flatness_storage):
+    """
+    Обновление порогов внутри Numba. Модифицирует массивы in-place.
+    """
+    # Update Elevation
+    for i in range(len(update_elevation)):
+        if len(update_elevation[i]) == 0: continue
+        
+        mean, stdev = calc_mean_stdev(update_elevation[i])
+        
+        if i == 0:
+            elevation_thr_arr[i] = mean + 3 * stdev
+            sensor_height_arr[0] = -mean
+        else:
+            elevation_thr_arr[i] = mean + 2 * stdev
+            
+        exceed_num = len(update_elevation[i]) - max_elevation_storage
+        if exceed_num > 0:
+            # Удаление элементов из начала списка (FIFO)
+            for _ in range(exceed_num):
+                update_elevation[i].pop(0)
+                
+    # Update Flatness
+    for i in range(len(update_flatness)):
+        if len(update_flatness[i]) <= 1: continue
+        
+        mean, stdev = calc_mean_stdev(update_flatness[i])
+        flatness_thr_arr[i] = mean + stdev
+        
+        exceed_num = len(update_flatness[i]) - max_flatness_storage
+        if exceed_num > 0:
+            for _ in range(exceed_num):
+                update_flatness[i].pop(0)
+
+@njit
+def ground_filter_core_stateful(pts, params_tuple, update_elevation, update_flatness, 
+                                elevation_thr_arr, flatness_thr_arr, sensor_height_arr):
+    """
+    Основная функция фильтрации. Принимает изменяемые массивы состояния.
+    """
     (verbose, enable_RNR, enable_RVPF, enable_TGR, num_iter, num_lpr, num_min_pts, 
      num_zones, num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr, 
-     sensor_height, th_seeds, th_dist, th_seeds_v, th_dist_v, max_range, min_range, 
+     sensor_height_init, th_seeds, th_dist, th_seeds_v, th_dist_v, max_range, min_range, 
      uprightness_thr, adaptive_seed_selection_margin, intensity_thr, 
-     num_sectors_each_zone, num_rings_each_zone, elevation_thr_arr, flatness_thr_arr, 
+     num_sectors_each_zone, num_rings_each_zone, 
      max_flatness_storage, max_elevation_storage, min_ranges, ring_sizes, sector_sizes) = params_tuple
 
     n_pts = pts.shape[0]
@@ -268,11 +295,10 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
     semantic = np.empty(n_pts, dtype=np.int32)
     semantic.fill(1) 
 
-    # ---------------------------------------------------------
-    # 1. Reflected Noise Removal (RNR)
-    # ---------------------------------------------------------
-    # Выполняем только если enable_RNR=True. 
-    # Если pts пришел размером (N, 4) с нулями, проверка intensity пройдет корректно.
+    # Используем текущее значение sensor_height из массива состояния
+    current_sensor_height = sensor_height_arr[0]
+
+    # RNR
     if enable_RNR:
         for i in range(n_pts):
             x, y, z, intensity = pts[i]
@@ -280,12 +306,10 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
             if r == 0: continue
             ver_angle_in_deg = math.atan2(z, r) * 180.0 / math.pi
             
-            if ver_angle_in_deg < RNR_ver_angle_thr and z < -sensor_height - 0.8 and intensity < RNR_intensity_thr:
+            if ver_angle_in_deg < RNR_ver_angle_thr and z < -current_sensor_height - 0.8 and intensity < RNR_intensity_thr:
                 semantic[i] = 2
 
-    # ---------------------------------------------------------
-    # 2. Concentric Zone Model (CZM) Binning
-    # ---------------------------------------------------------
+    # CZM
     czm = typed.List()
     for k in range(num_zones):
         zone = typed.List()
@@ -339,9 +363,7 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
         pt = np.array([x, y, z, float(i)], dtype=np.float64)
         czm[zone_idx][ring_idx][sector_idx].append(pt)
 
-    # ---------------------------------------------------------
-    # 3. Ground Estimation
-    # ---------------------------------------------------------
+    # Ground Estimation
     concentric_idx = 0
     
     candidates_flatness = typed.List.empty_list(float64)
@@ -367,7 +389,7 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                 p_sorted = patch_arr[sort_indices]
                 
                 regionwise_ground, regionwise_nonground = extract_piecewiseground(
-                    zone_idx, p_sorted, sensor_height, adaptive_seed_selection_margin, num_lpr, num_iter,
+                    zone_idx, p_sorted, current_sensor_height, adaptive_seed_selection_margin, num_lpr, num_iter,
                     th_seeds_v, th_dist_v, th_seeds, th_dist, uprightness_thr, enable_RVPF
                 )
                 
@@ -381,7 +403,6 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                 if singular_values[1] != 0:
                     line_variable = singular_values[0] / singular_values[1]
                 
-                # Исправление warning: np.sum вместо np.dot для векторов
                 heading = np.sum(pc_mean * normal)
                 
                 is_upright = ground_uprightness > uprightness_thr
@@ -396,8 +417,8 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                     is_flat = ground_flatness < flatness_thr_arr[concentric_idx]
                 
                 if is_upright and is_not_elevated and is_near_zone:
-                    update_elevation_lists[concentric_idx].append(ground_elevation)
-                    update_flatness_lists[concentric_idx].append(ground_flatness)
+                    update_elevation[concentric_idx].append(ground_elevation)
+                    update_flatness[concentric_idx].append(ground_flatness)
                     ringwise_flatness.append(ground_flatness)
                 
                 if not is_upright:
@@ -436,6 +457,10 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
             
             concentric_idx += 1
             
+    # Обновление порогов (A-GLE)
+    update_thresholds_core(update_elevation, update_flatness, elevation_thr_arr, flatness_thr_arr, 
+                           sensor_height_arr, max_elevation_storage, max_flatness_storage)
+            
     return semantic
 
 # --------------------------------------------------------------------------------
@@ -459,7 +484,7 @@ class PatchWorkpp:
         
         self.RNR_ver_angle_thr = params.get('RNR_ver_angle_thr', -15.0)
         self.RNR_intensity_thr = params.get('RNR_intensity_thr', 0.2)
-        self.sensor_height = params.get('sensor_height', 1.723)
+        self.initial_sensor_height = params.get('sensor_height', 1.723)
         self.th_seeds = params.get('th_seeds', 0.125)
         self.th_dist = params.get('th_dist', 0.125)
         self.th_seeds_v = params.get('th_seeds_v', 0.25)
@@ -476,9 +501,22 @@ class PatchWorkpp:
         self.max_flatness_storage = params.get('max_flatness_storage', 1000)
         self.max_elevation_storage = params.get('max_elevation_storage', 1000)
         
+        # Инициализация состояния
+        # Используем typed.List для истории, чтобы Numba могли их менять in-place
+        self.update_elevation_ = typed.List()
+        self.update_flatness_ = typed.List()
+        for _ in range(4):
+            self.update_elevation_.append(typed.List.empty_list(float64))
+            self.update_flatness_.append(typed.List.empty_list(float64))
+        
+        # Пороги (массивы numpy, изменяются in-place)
         self.elevation_thr = np.array(params.get('elevation_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         self.flatness_thr = np.array(params.get('flatness_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         
+        # Sensor height храним в массиве размера 1, чтобы Numba мог менять значение
+        self.sensor_height_ = np.array([self.initial_sensor_height], dtype=np.float64)
+        
+        # Pre-calc ranges
         min_range_z2 = (7 * self.min_range + self.max_range) / 8.0
         min_range_z3 = (3 * self.min_range + self.max_range) / 4.0
         min_range_z4 = (self.min_range + self.max_range) / 2.0
@@ -497,63 +535,68 @@ class PatchWorkpp:
             2 * math.pi / self.num_sectors_each_zone[2],
             2 * math.pi / self.num_sectors_each_zone[3]
         ], dtype=np.float64)
-        
-        self.update_elevation_ = [typed.List.empty_list(float64) for _ in range(4)]
-        self.update_flatness_ = [typed.List.empty_list(float64) for _ in range(4)]
 
-    def estimateGround(self, cloud_in):
+    @property
+    def sensor_height(self):
+        return self.sensor_height_[0]
+
+    def forward(self, cloud_in, verbose=False):
+        """
+        Основной метод. Принимает облако точек (N, 3) или (N, 4).
+        Возвращает semantic labels.
+        """
+        # 1. Обработка входных данных
         pts = cloud_in.astype(np.float64)
         
-        update_elev_typed = typed.List()
-        for lst in self.update_elevation_:
-            update_elev_typed.append(lst)
-            
-        update_flat_typed = typed.List()
-        for lst in self.update_flatness_:
-            update_flat_typed.append(lst)
-            
+        # Если передали только xyz, добавляем колонку интенсивности (0)
+        if pts.shape[1] == 3:
+            temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float64)
+            temp_pts[:, :3] = pts
+            pts = temp_pts
+        elif pts.shape[1] == 4:
+            pts = pts # OK
+        else:
+             raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
+
+        # Валидация (NaN/Inf)
+        valid_mask = np.isfinite(pts).all(axis=1)
+        clean_pts = pts[valid_mask]
+        
+        # 2. Формирование кортежа параметров (immutable part)
         params_tuple = (
             self.verbose, self.enable_RNR, self.enable_RVPF, self.enable_TGR,
             self.num_iter, self.num_lpr, self.num_min_pts, self.num_zones,
             self.num_rings_of_interest, self.RNR_ver_angle_thr, self.RNR_intensity_thr,
-            self.sensor_height, self.th_seeds, self.th_dist, self.th_seeds_v, self.th_dist_v,
+            self.initial_sensor_height, # передаем начальный, но внутри используется self.sensor_height_
+            self.th_seeds, self.th_dist, self.th_seeds_v, self.th_dist_v,
             self.max_range, self.min_range, self.uprightness_thr,
             self.adaptive_seed_selection_margin, self.intensity_thr,
             self.num_sectors_each_zone, self.num_rings_each_zone,
-            self.elevation_thr, self.flatness_thr,
             self.max_flatness_storage, self.max_elevation_storage,
             self.min_ranges, self.ring_sizes, self.sector_sizes
         )
         
-        semantic = ground_filter_core(pts, params_tuple, update_elev_typed, update_flat_typed)
-        
-        self.update_elevation_ = [lst for lst in update_elev_typed]
-        self.update_flatness_ = [lst for lst in update_flat_typed]
-        self._update_thr()
-        
-        return semantic
+        # 3. Вызов ядра
+        semantic = ground_filter_core_stateful(
+            clean_pts, params_tuple, 
+            self.update_elevation_, self.update_flatness_, 
+            self.elevation_thr, self.flatness_thr, self.sensor_height_
+        )
+        if verbose:
+            print(f"PatchWork++ State Update sensor_height: {self.sensor_height_[0]:.4f}")
+            print(f"PatchWork++ State Update elevation_thr: {self.elevation_thr}")
+            print(f"PatchWork++ State Update flatness_thr:  {self.flatness_thr}")
 
-    def _update_thr(self):
-        for i in range(self.num_rings_of_interest):
-            if len(self.update_elevation_[i]) == 0: continue
-            vec = np.array(self.update_elevation_[i])
-            mean = np.mean(vec)
-            stdev = np.std(vec)
-            if i == 0:
-                self.elevation_thr[i] = mean + 3 * stdev
-                self.sensor_height = -mean
-            else:
-                self.elevation_thr[i] = mean + 2 * stdev
-                
-        for i in range(self.num_rings_of_interest):
-            if len(self.update_flatness_[i]) <= 1: continue
-            vec = np.array(self.update_flatness_[i])
-            mean = np.mean(vec)
-            stdev = np.std(vec)
-            self.flatness_thr[i] = mean + stdev
+
+        # 4. Восстановление полного массива меток
+        full_semantic = np.empty(len(pts), dtype=np.int32)
+        full_semantic.fill(1)
+        full_semantic[valid_mask] = semantic
+        
+        return full_semantic
 
 # --------------------------------------------------------------------------------
-# Forward Function (Interface)
+# Convenience Function (остается для совместимости, но создает временный инстанс)
 # --------------------------------------------------------------------------------
 
 def GroundFilterForward(
@@ -621,25 +664,6 @@ def GroundFilterForward(
         'max_elevation_storage': max_elevation_storage
     }
     
-    # Автоматическое добавление колонки интенсивности, если её нет
-    if pts.shape[1] == 3:
-        # Создаем массив (N, 4) и заполняем x,y,z, intensity=0
-        temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float32)
-        temp_pts[:, :3] = pts
-        pts = temp_pts
-    elif pts.shape[1] == 4:
-        pass
-    else:
-        raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
-    
-    valid_mask = np.isfinite(pts).all(axis=1)
-    clean_pts = pts[valid_mask]
-    
+    # Создаем временный объект
     pw = PatchWorkpp(params)
-    semantic = pw.estimateGround(clean_pts)
-    
-    full_semantic = np.empty(len(pts), dtype=np.int32)
-    full_semantic.fill(1)
-    full_semantic[valid_mask] = semantic
-    
-    return full_semantic
+    return pw.forward(pts)
