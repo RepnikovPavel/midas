@@ -65,12 +65,12 @@ if __name__ == "__main__":
                 pts_ego = snapshot.lidar['points'] # N,3 xyz
                 print(f"pts shape {pts_ego.shape}")
                 boxes_3d_ego = snapshot.boxes['boxes']
+                vis.process_events()
                 t1 = time.perf_counter_ns()
                 labels = patchworkpp.GroundFilterForward_fp32(
                     # pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
                     pts=pts_ego, #: np.ndarray,
                     verbose=False, #: bool = False,
-                    enable_RNR=False,#: bool = True,reflected_noise_removal
                     enable_RVPF=True,#: bool = True,
                     enable_TGR=True,#: bool = True,
                     sensor_height=-100.0,#: float = 1.723,
@@ -89,7 +89,6 @@ if __name__ == "__main__":
                     min_range=2.7,#: float = 2.7,
                     # uprightness_thr: float = 0.707,
                     adaptive_seed_selection_margin=-1000.0#: float = -1.2,
-                    # intensity_thr: float = 0.0,
                     # num_sectors_each_zone: np.ndarray = None,
                     # num_rings_each_zone: np.ndarray = None,
                     # elevation_thr: np.ndarray = None,
@@ -100,6 +99,8 @@ if __name__ == "__main__":
                 t2 = time.perf_counter_ns()
                 print(f"gfpy forward {(t2-t1)/1e6:.2f} ms")
                 print('labels',np.unique(labels,return_counts=True))
+                vis.process_events()
+
                 pts_colors = colorize_point_cloud(pts_ego,labels)
                 # if label==0 make red color for this points
                 # else: just jet along z
@@ -108,6 +109,7 @@ if __name__ == "__main__":
                 {'lat': 37.7747430157756, 'long': -122.40097178666713, 'height': 3.0745996995937364, 'speed': 9.005294706004106}
                 """
                 print(snapshot.gps) 
+                vis.process_events()
 
                 vis.update(
                     [
@@ -122,5 +124,4 @@ if __name__ == "__main__":
                         }
                     ]
                 )
-
                 vis.process_events()

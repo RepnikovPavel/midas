@@ -276,10 +276,10 @@ def update_thresholds_core_fp32(update_elevation, update_flatness, elevation_thr
 @njit
 def ground_filter_core_stateful_fp32(pts, params_tuple, update_elevation, update_flatness, 
                                 elevation_thr_arr, flatness_thr_arr, sensor_height_arr):
-    (verbose, enable_RNR, enable_RVPF, enable_TGR, num_iter, num_lpr, num_min_pts, 
-     num_zones, num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr, 
+    (verbose, enable_RVPF, enable_TGR, num_iter, num_lpr, num_min_pts, 
+     num_zones, num_rings_of_interest,  
      sensor_height_init, th_seeds, th_dist, th_seeds_v, th_dist_v, max_range, min_range, 
-     uprightness_thr, adaptive_seed_selection_margin, intensity_thr, 
+     uprightness_thr, adaptive_seed_selection_margin, 
      num_sectors_each_zone, num_rings_each_zone, 
      max_flatness_storage, max_elevation_storage, min_ranges, ring_sizes, sector_sizes) = params_tuple
 
@@ -289,17 +289,6 @@ def ground_filter_core_stateful_fp32(pts, params_tuple, update_elevation, update
     semantic.fill(1) 
 
     current_sensor_height = sensor_height_arr[0]
-
-    # RNR
-    if enable_RNR:
-        for i in range(n_pts):
-            x, y, z, intensity = pts[i]
-            r = math.sqrt(x*x + y*y)
-            if r == 0: continue
-            ver_angle_in_deg = math.atan2(z, r) * 180.0 / math.pi
-            
-            if ver_angle_in_deg < RNR_ver_angle_thr and z < -current_sensor_height - 0.8 and intensity < RNR_intensity_thr:
-                semantic[i] = 2
 
     # CZM
     czm = typed.List()
@@ -313,14 +302,13 @@ def ground_filter_core_stateful_fp32(pts, params_tuple, update_elevation, update
         czm.append(zone)
 
     for i in range(n_pts):
-        if semantic[i] == 2:
-            continue
-            
-        x, y, z, intensity = pts[i]
+        # RNR removed
+        
+        x, y, z = pts[i] # Only XYZ now
         r = math.sqrt(x*x + y*y)
         
         if not (r <= max_range and r > min_range):
-            if semantic[i] != 2:
+            if semantic[i] != 2: # Keep logic consistent though RNR is gone
                 semantic[i] = 3
             continue
             
@@ -352,6 +340,7 @@ def ground_filter_core_stateful_fp32(pts, params_tuple, update_elevation, update
         if ring_idx < 0: ring_idx = 0
         if sector_idx < 0: sector_idx = 0
         
+        # Store point with index
         pt = np.array([x, y, z, float(i)], dtype=np.float32)
         czm[zone_idx][ring_idx][sector_idx].append(pt)
 
@@ -464,7 +453,7 @@ class PatchWorkpp_fp32:
             params = {}
             
         self.verbose = params.get('verbose', False)
-        self.enable_RNR = params.get('enable_RNR', True)
+        # RNR removed
         self.enable_RVPF = params.get('enable_RVPF', True)
         self.enable_TGR = params.get('enable_TGR', True)
         self.num_iter = params.get('num_iter', 3)
@@ -473,8 +462,8 @@ class PatchWorkpp_fp32:
         self.num_zones = params.get('num_zones', 4)
         self.num_rings_of_interest = params.get('num_rings_of_interest', 4)
         
-        self.RNR_ver_angle_thr = params.get('RNR_ver_angle_thr', -15.0)
-        self.RNR_intensity_thr = params.get('RNR_intensity_thr', 0.2)
+        # RNR parameters removed
+        
         self.initial_sensor_height = params.get('sensor_height', 1.723)
         self.th_seeds = params.get('th_seeds', 0.125)
         self.th_dist = params.get('th_dist', 0.125)
@@ -484,7 +473,7 @@ class PatchWorkpp_fp32:
         self.min_range = params.get('min_range', 2.7)
         self.uprightness_thr = params.get('uprightness_thr', 0.707)
         self.adaptive_seed_selection_margin = params.get('adaptive_seed_selection_margin', -1.2)
-        self.intensity_thr = params.get('intensity_thr', 0.0)
+        # Intensity thr removed
         
         self.num_sectors_each_zone = np.array(params.get('num_sectors_each_zone', [16, 32, 54, 32]), dtype=np.int64)
         self.num_rings_each_zone = np.array(params.get('num_rings_each_zone', [2, 4, 4, 4]), dtype=np.int64)
@@ -528,26 +517,32 @@ class PatchWorkpp_fp32:
         return self.sensor_height_[0]
 
     def forward(self, cloud_in, verbose=False):
+        # Ensure FP32
         pts = cloud_in.astype(np.float32)
         
-        if pts.shape[1] == 3:
-            temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float32)
-            temp_pts[:, :3] = pts
+        # Handle XYZ input (N, 3) or (N, 4). If N,4, we strip the intensity just in case.
+        if pts.shape[1] == 4:
+            # Take only XYZ
+            temp_pts = np.zeros((pts.shape[0], 3), dtype=np.float32)
+            temp_pts[:, :3] = pts[:, :3]
             pts = temp_pts
-        elif pts.shape[1] != 4:
+        elif pts.shape[1] == 3:
+            # Use as is
+            pass
+        else:
              raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
 
         valid_mask = np.isfinite(pts).all(axis=1)
         clean_pts = pts[valid_mask]
         
         params_tuple = (
-            self.verbose, self.enable_RNR, self.enable_RVPF, self.enable_TGR,
+            self.verbose, self.enable_RVPF, self.enable_TGR,
             self.num_iter, self.num_lpr, self.num_min_pts, self.num_zones,
-            self.num_rings_of_interest, self.RNR_ver_angle_thr, self.RNR_intensity_thr,
+            self.num_rings_of_interest, 
             self.initial_sensor_height,
             self.th_seeds, self.th_dist, self.th_seeds_v, self.th_dist_v,
             self.max_range, self.min_range, self.uprightness_thr,
-            self.adaptive_seed_selection_margin, self.intensity_thr,
+            self.adaptive_seed_selection_margin, 
             self.num_sectors_each_zone, self.num_rings_each_zone,
             self.max_flatness_storage, self.max_elevation_storage,
             self.min_ranges, self.ring_sizes, self.sector_sizes
@@ -564,7 +559,7 @@ class PatchWorkpp_fp32:
             print(f"PatchWork++ (FP32) State Update elevation_thr: {self.elevation_thr}")
             print(f"PatchWork++ (FP32) State Update flatness_thr:  {self.flatness_thr}")
 
-        full_semantic = np.empty(len(pts), dtype=np.int32)
+        full_semantic = np.empty(len(cloud_in), dtype=np.int32)
         full_semantic.fill(1)
         full_semantic[valid_mask] = semantic
         
@@ -577,7 +572,6 @@ class PatchWorkpp_fp32:
 def GroundFilterForward_fp32(
     pts, 
     verbose=False,
-    enable_RNR=True,
     enable_RVPF=True,
     enable_TGR=True,
     num_iter=3,
@@ -585,8 +579,6 @@ def GroundFilterForward_fp32(
     num_min_pts=10,
     num_zones=4,
     num_rings_of_interest=4,
-    RNR_ver_angle_thr=-15.0,
-    RNR_intensity_thr=0.2,
     sensor_height=1.723,
     th_seeds=0.125,
     th_dist=0.125,
@@ -596,7 +588,6 @@ def GroundFilterForward_fp32(
     min_range=2.7,
     uprightness_thr=0.707,
     adaptive_seed_selection_margin=-1.2,
-    intensity_thr=0.0,
     num_sectors_each_zone=None,
     num_rings_each_zone=None,
     elevation_thr=None,
@@ -612,30 +603,30 @@ def GroundFilterForward_fp32(
 
     # 2. Input processing
     pts = pts.astype(np.float32)
-    if pts.shape[1] == 3:
-        temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float32)
-        temp_pts[:, :3] = pts
+    if pts.shape[1] == 4:
+        # Drop intensity
+        temp_pts = np.zeros((pts.shape[0], 3), dtype=np.float32)
+        temp_pts[:, :3] = pts[:, :3]
         pts = temp_pts
-    elif pts.shape[1] != 4:
+    elif pts.shape[1] == 3:
+        pass
+    else:
          raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
 
     valid_mask = np.isfinite(pts).all(axis=1)
     clean_pts = pts[valid_mask]
 
-    # 3. Initialize Temp State (Stateless behavior)
-    # Create fresh lists for this call
+    # 3. Initialize Temp State
     update_elevation = typed.List()
     update_flatness = typed.List()
     for _ in range(4):
         update_elevation.append(typed.List.empty_list(float32))
         update_flatness.append(typed.List.empty_list(float32))
     
-    # Arrays for thresholds (copies to avoid modifying inputs)
     elevation_thr_arr = np.array(elevation_thr, dtype=np.float32)
     flatness_thr_arr = np.array(flatness_thr, dtype=np.float32)
     sensor_height_arr = np.array([sensor_height], dtype=np.float32)
     
-    # Pre-calc geometry
     num_sectors_each_zone_np = np.array(num_sectors_each_zone, dtype=np.int64)
     num_rings_each_zone_np = np.array(num_rings_each_zone, dtype=np.int64)
     
@@ -660,13 +651,13 @@ def GroundFilterForward_fp32(
 
     # 4. Params Tuple
     params_tuple = (
-        verbose, enable_RNR, enable_RVPF, enable_TGR,
+        verbose, enable_RVPF, enable_TGR,
         num_iter, num_lpr, num_min_pts, num_zones,
-        num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr,
+        num_rings_of_interest, 
         sensor_height, # initial
         th_seeds, th_dist, th_seeds_v, th_dist_v,
         max_range, min_range, uprightness_thr,
-        adaptive_seed_selection_margin, intensity_thr,
+        adaptive_seed_selection_margin, 
         num_sectors_each_zone_np, num_rings_each_zone_np,
         max_flatness_storage, max_elevation_storage,
         min_ranges, ring_sizes, sector_sizes
