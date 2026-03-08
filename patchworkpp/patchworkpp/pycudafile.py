@@ -13,6 +13,7 @@ cuda_kernel_code = """
 #include <math.h>
 
 #define PI 3.14159265358979323846f
+// Max points allowed in Shared Memory for sorting/fitting per bin
 #define SMEM_CAP 4096 
 
 __device__ float xy2theta_device(float x, float y) {
@@ -175,9 +176,9 @@ __global__ void kernel_ground_filter_stateful(
     float* s_z = (float*)smem_raw;
     int* s_orig_idx = (int*)&s_z[SMEM_CAP];
     
-    int process_count = count_in_bin;
-    if (process_count > SMEM_CAP) process_count = SMEM_CAP;
+    int process_count = min(count_in_bin, SMEM_CAP);
     
+    // Load & Sort only the first process_count points (lowest Z assumption holds after sort)
     for (int k = tid; k < process_count; k += blockDim.x) {
         long long pt_idx = sorted_indices[start_idx + k];
         s_z[k] = pts[pt_idx * 3 + 2];
@@ -316,39 +317,45 @@ __global__ void kernel_ground_filter_stateful(
         }
     }
     
-    // Final labeling
-    for (int k = tid; k < process_count; k += blockDim.x) {
-        int pt_idx = s_orig_idx[k];
+    // Final labeling - Iterate over ALL points in bin (count_in_bin), not just process_count
+    for (int k = tid; k < count_in_bin; k += blockDim.x) {
+        int pt_idx;
+        float dist;
         
-        // Calculate distance to estimated plane
-        float dist = normal[0]*pts[pt_idx*3+0] + normal[1]*pts[pt_idx*3+1] + normal[2]*pts[pt_idx*3+2] + d;
-        bool is_nonground_mask = (dist >= th_dist); // Equivalent to !is_ground
+        // If within the sorted range, use shared memory (fast)
+        if (k < process_count) {
+            pt_idx = s_orig_idx[k];
+            // X and Y are needed for dist, Z is in s_z. 
+            // We still read from global pts to avoid complex register usage, 
+            // but s_orig_idx is the important cached part.
+        } else {
+            // If outside sorted range, read from global memory
+            pt_idx = sorted_indices[start_idx + k];
+        }
         
-        int label = 1; // Default non-ground
+        // Calculate distance
+        dist = normal[0]*pts[pt_idx*3+0] + normal[1]*pts[pt_idx*3+1] + normal[2]*pts[pt_idx*3+2] + d;
+        
+        bool is_nonground_mask = (dist >= th_dist);
+        int label = 1; 
 
         if (!is_upright) {
             label = 1;
         }
         else if (!is_near_zone) {
-            // Numba logic: init 0, then if is_nonground -> 1.
-            // Result: is_nonground ? 1 : 0.
             label = is_nonground_mask ? 1 : 0;
         }
         else if (!is_heading_outside) {
             label = 1;
         }
         else if (is_not_elevated || is_flat) {
-            // Numba logic: if is_ground -> 0 else 1. Then if is_nonground -> 1.
-            // Result: is_nonground ? 1 : 0.
             label = is_nonground_mask ? 1 : 0;
         }
         else {
             label = 1;
         }
         
-        // The final loop in Numba: 
-        // for k: if is_nonground_mask[k]: semantic = 1
-        // This overrides any previous '0' if the point is non-ground.
+        // Apply Numba logic override
         if (is_nonground_mask) {
             label = 1;
         }
