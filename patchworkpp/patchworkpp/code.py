@@ -47,7 +47,6 @@ def estimate_plane(points):
     """
     n_pts = points.shape[0]
     if n_pts == 0:
-        # Возвращаем пустые значения
         return np.zeros(3, dtype=np.float64), 0.0, np.zeros(3, dtype=np.float64), np.zeros(3, dtype=np.float64)
 
     # 1. Вычисление среднего (центроида)
@@ -59,7 +58,6 @@ def estimate_plane(points):
     # 2. Вычисление ковариационной матрицы
     cov = np.zeros((3, 3), dtype=np.float64)
     for i in range(n_pts):
-        # Центрирование точки
         p = points[i, :3] - pc_mean
         cov += np.outer(p, p)
     
@@ -69,30 +67,24 @@ def estimate_plane(points):
     # 3. SVD
     U, S, Vt = np.linalg.svd(cov)
     
-    # Нормаль - это последний столбец U (соответствует наименьшему сингулярному числу)
+    # Нормаль - это последний столбец U
     normal = U[:, 2]
     
-    # Ориентация нормали: Z-компонента должна быть положительной (смотрит вверх)
+    # Ориентация нормали
     if normal[2] < 0:
         normal = -normal
         
     # d = -normal . pc_mean
-    d = -np.dot(normal, pc_mean)
+    d = -np.sum(normal * pc_mean)
     
     return normal, d, S, pc_mean
 
 @njit
 def extract_initial_seeds(zone_idx, p_sorted, sensor_height, adaptive_seed_selection_margin, num_lpr, th_seed):
-    """
-    Извлечение начальных семян для R-GPF / R-VPF.
-    p_sorted: (N, 4) массив, отсортированный по Z.
-    Возвращает: массив семян (M, 4)
-    """
     n_pts = p_sorted.shape[0]
     if n_pts == 0:
         return np.zeros((0, 4), dtype=np.float64)
 
-    # 1. Пропуск слишком низких точек в зоне 0 (шум)
     init_idx = 0
     if zone_idx == 0:
         threshold = adaptive_seed_selection_margin * sensor_height
@@ -102,7 +94,6 @@ def extract_initial_seeds(zone_idx, p_sorted, sensor_height, adaptive_seed_selec
             else:
                 break
     
-    # 2. Вычисление LPR (Lowest Point Representative) высоты
     sum_val = 0.0
     cnt = 0
     limit = min(n_pts, init_idx + num_lpr)
@@ -115,14 +106,11 @@ def extract_initial_seeds(zone_idx, p_sorted, sensor_height, adaptive_seed_selec
     if cnt != 0:
         lpr_height = sum_val / cnt
         
-    # 3. Сбор семян
     seeds_list = typed.List.empty_list(float64[:])
     for i in range(n_pts):
         if p_sorted[i, 2] < lpr_height + th_seed:
-            # Копируем точку (включая индекс)
             seeds_list.append(p_sorted[i].copy())
             
-    # Преобразование в массив
     seeds_arr = np.zeros((len(seeds_list), 4), dtype=np.float64)
     for k in range(len(seeds_list)):
         seeds_arr[k] = seeds_list[k]
@@ -132,36 +120,22 @@ def extract_initial_seeds(zone_idx, p_sorted, sensor_height, adaptive_seed_selec
 @njit
 def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selection_margin, num_lpr, num_iter, 
                             th_seeds_v, th_dist_v, th_seeds, th_dist, uprightness_thr, enable_RVPF):
-    """
-    R-VPF и R-GPF логика.
-    src: (N, 4) массив точек.
-    Возвращает: (ground_dst, nonground_dst) - массивы (M, 4) и (K, 4)
-    """
     
-    # Списки для результатов
     non_ground_dst_list = typed.List.empty_list(float64[:])
-    
-    # Текущий набор точек для обработки
-    # В C++ это vector<PointXYZ> src_wo_verticals
     current_src_list = typed.List.empty_list(float64[:])
     for i in range(src.shape[0]):
         current_src_list.append(src[i])
         
-    # ---------------------------------------------------------
-    # 1. R-VPF (Region-wise Vertical Plane Fitting)
-    # ---------------------------------------------------------
+    # R-VPF
     if enable_RVPF:
         for _ in range(num_iter):
             if len(current_src_list) == 0:
                 break
                 
-            # Конвертация в массив для обработки
             temp_arr = np.zeros((len(current_src_list), 4), dtype=np.float64)
             for k in range(len(current_src_list)):
                 temp_arr[k] = current_src_list[k]
             
-            # Сортировка по Z для извлечения семян
-            # (Семена извлекаются из самых низких точек)
             sort_indices = np.argsort(temp_arr[:, 2])
             p_sorted = temp_arr[sort_indices]
             
@@ -172,28 +146,21 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
                 
             normal, d, S, pc_mean = estimate_plane(seeds)
             
-            # Если плоскость вертикальная (нормаль почти горизонтальна), это не земля
             if zone_idx == 0 and normal[2] < uprightness_thr:
                 next_src_list = typed.List.empty_list(float64[:])
                 
                 for point in current_src_list:
-                    # point: [x, y, z, idx]
                     dist = normal[0] * point[0] + normal[1] * point[1] + normal[2] * point[2] + d
                     if abs(dist) < th_dist_v:
-                        # Точка принадлежит вертикальной плоскости -> не земля
                         non_ground_dst_list.append(point)
                     else:
-                        # Оставляем для следующей итерации или поиска земли
                         next_src_list.append(point)
                 
                 current_src_list = next_src_list
             else:
-                # Плоскость не вертикальная, прерываем R-VPF
                 break
     
-    # ---------------------------------------------------------
-    # 2. R-GPF (Region-wise Ground Plane Fitting)
-    # ---------------------------------------------------------
+    # R-GPF
     if len(current_src_list) == 0:
         dst_arr = np.zeros((0, 4), dtype=np.float64)
         non_ground_arr = np.zeros((len(non_ground_dst_list), 4), dtype=np.float64)
@@ -201,20 +168,16 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
             non_ground_arr[k] = non_ground_dst_list[k]
         return dst_arr, non_ground_arr
 
-    # Подготовка данных
     src_arr = np.zeros((len(current_src_list), 4), dtype=np.float64)
     for k in range(len(current_src_list)):
         src_arr[k] = current_src_list[k]
         
-    # Сортировка по Z
     sort_indices = np.argsort(src_arr[:, 2])
     p_sorted = src_arr[sort_indices]
     
-    # Начальные семена
     init_seeds = extract_initial_seeds(zone_idx, p_sorted, sensor_height, adaptive_seed_selection_margin, num_lpr, th_seeds)
     
     if init_seeds.shape[0] == 0:
-        # Если семян нет, считаем всё не землей
         for p in current_src_list:
             non_ground_dst_list.append(p)
         dst_arr = np.zeros((0, 4), dtype=np.float64)
@@ -230,7 +193,6 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
         
         ground_list = typed.List.empty_list(float64[:])
         
-        # Обновление точек земли на основе расстояния до плоскости
         for point in current_src_list:
             dist = normal[0] * point[0] + normal[1] * point[1] + normal[2] * point[2] + d
             
@@ -238,13 +200,11 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
                 if dist < th_dist:
                     ground_list.append(point)
             else:
-                # Последняя итерация: разделение на землю и не землю
                 if dist < th_dist:
                     ground_list.append(point)
                 else:
                     non_ground_dst_list.append(point)
         
-        # Подготовка к следующей итерации
         if i < num_iter - 1:
             if len(ground_list) == 0:
                 break
@@ -252,12 +212,10 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
             for k in range(len(ground_list)):
                 ground_pc_arr[k] = ground_list[k]
         else:
-            # Финальный результат
             dst_arr = np.zeros((len(ground_list), 4), dtype=np.float64)
             for k in range(len(ground_list)):
                 dst_arr[k] = ground_list[k]
                 
-    # Собираем не-землю
     non_ground_arr = np.zeros((len(non_ground_dst_list), 4), dtype=np.float64)
     for k in range(len(non_ground_dst_list)):
         non_ground_arr[k] = non_ground_dst_list[k]
@@ -267,9 +225,6 @@ def extract_piecewiseground(zone_idx, src, sensor_height, adaptive_seed_selectio
 @njit
 def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_var, 
                            candidates_ground_points_list, th_dist):
-    """
-    TGR логика. Возвращает список индексов, которые нужно вернуть в землю.
-    """
     mean_flatness, stdev_flatness = calc_mean_stdev(ring_flatness)
     
     revert_indices = typed.List.empty_list(int64)
@@ -281,7 +236,6 @@ def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_v
         
         mu_flatness = mean_flatness + 1.5 * stdev_flatness
         
-        # Защита от деления на ноль
         denom = mu_flatness / 10.0
         if denom == 0: denom = 1e-9
         
@@ -295,7 +249,6 @@ def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_v
             prob_line = 0.0
             
         if prob_line * prob_flatness > 0.5:
-            # Revert: добавляем индексы точек в список земли
             for k in range(c_ground.shape[0]):
                 revert_indices.append(int(c_ground[k, 3]))
                 
@@ -303,7 +256,6 @@ def temporal_ground_revert(ring_flatness, candidates_flatness, candidates_line_v
 
 @njit
 def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatness_lists):
-    # Распаковка параметров
     (verbose, enable_RNR, enable_RVPF, enable_TGR, num_iter, num_lpr, num_min_pts, 
      num_zones, num_rings_of_interest, RNR_ver_angle_thr, RNR_intensity_thr, 
      sensor_height, th_seeds, th_dist, th_seeds_v, th_dist_v, max_range, min_range, 
@@ -313,39 +265,27 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
 
     n_pts = pts.shape[0]
     
-    # 0: Земля
-    # 1: Не земля
-    # 2: Отраженный шум (RNR)
-    # 3: Вне диапазона
     semantic = np.empty(n_pts, dtype=np.int32)
     semantic.fill(1) 
 
     # ---------------------------------------------------------
     # 1. Reflected Noise Removal (RNR)
     # ---------------------------------------------------------
-    # В C++ RNR меняет z на -FLT_MAX, чтобы игнорировать в дальнейшем.
-    # Мы просто пометим их здесь, а при биннинге проверим диапазон.
-    # Но чтобы точно копировать логику z-check в pc2czm, нужно модифицировать точки.
-    # Создадим копию точек для внутренней работы, чтобы не портить вход (хотя в C++ портится cloud_in)
-    # В Numba лучше не менять входной массив, если это возможно, но C++ меняет.
-    # Мы будем использовать флаг.
-    
-    # Тем не менее, RNR должен запускаться первым.
-    for i in range(n_pts):
-        x, y, z, intensity = pts[i]
-        r = math.sqrt(x*x + y*y)
-        if r == 0: continue
-        ver_angle_in_deg = math.atan2(z, r) * 180.0 / math.pi
-        
-        if ver_angle_in_deg < RNR_ver_angle_thr and z < -sensor_height - 0.8 and intensity < RNR_intensity_thr:
-            semantic[i] = 2
-            # В C++ точка помечается z = -FLT_MAX и потом пропускается в pc2czm
-            # Мы просто пропустим её при биннинге, если semantic[i] == 2
+    # Выполняем только если enable_RNR=True. 
+    # Если pts пришел размером (N, 4) с нулями, проверка intensity пройдет корректно.
+    if enable_RNR:
+        for i in range(n_pts):
+            x, y, z, intensity = pts[i]
+            r = math.sqrt(x*x + y*y)
+            if r == 0: continue
+            ver_angle_in_deg = math.atan2(z, r) * 180.0 / math.pi
+            
+            if ver_angle_in_deg < RNR_ver_angle_thr and z < -sensor_height - 0.8 and intensity < RNR_intensity_thr:
+                semantic[i] = 2
 
     # ---------------------------------------------------------
     # 2. Concentric Zone Model (CZM) Binning
     # ---------------------------------------------------------
-    # Структура: czm[zone][ring][sector] -> список точек (x,y,z,idx)
     czm = typed.List()
     for k in range(num_zones):
         zone = typed.List()
@@ -356,9 +296,7 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
             zone.append(ring)
         czm.append(zone)
 
-    # Заполнение
     for i in range(n_pts):
-        # Пропускаем RNR точки
         if semantic[i] == 2:
             continue
             
@@ -366,13 +304,12 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
         r = math.sqrt(x*x + y*y)
         
         if not (r <= max_range and r > min_range):
-            if semantic[i] != 2: # RNR уже помечен
-                semantic[i] = 3 # Вне диапазона
+            if semantic[i] != 2:
+                semantic[i] = 3
             continue
             
         theta = xy2theta(x, y)
         
-        # Определение зоны
         zone_idx = -1
         ring_idx = -1
         sector_idx = -1
@@ -394,13 +331,11 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
             ring_idx = int((r - min_ranges[3]) / ring_sizes[3])
             sector_idx = int(theta / sector_sizes[3])
             
-        # Clip indices
         if ring_idx >= num_rings_each_zone[zone_idx]: ring_idx = num_rings_each_zone[zone_idx] - 1
         if sector_idx >= num_sectors_each_zone[zone_idx]: sector_idx = num_sectors_each_zone[zone_idx] - 1
         if ring_idx < 0: ring_idx = 0
         if sector_idx < 0: sector_idx = 0
         
-        # Добавляем точку. Формат: [x, y, z, original_index]
         pt = np.array([x, y, z, float(i)], dtype=np.float64)
         czm[zone_idx][ring_idx][sector_idx].append(pt)
 
@@ -409,7 +344,6 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
     # ---------------------------------------------------------
     concentric_idx = 0
     
-    # Для TGR
     candidates_flatness = typed.List.empty_list(float64)
     candidates_line_var = typed.List.empty_list(float64)
     candidates_ground_points = typed.List.empty_list(float64[:,:])
@@ -421,39 +355,34 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                 patch_list = czm[zone_idx][ring_idx][sector_idx]
                 
                 if len(patch_list) < num_min_pts:
-                    # Слишком мало точек -> не земля
                     for p in patch_list:
                         semantic[int(p[3])] = 1
                     continue
                 
-                # Преобразование в массив и сортировка
                 patch_arr = np.zeros((len(patch_list), 4), dtype=np.float64)
                 for k in range(len(patch_list)):
                     patch_arr[k] = patch_list[k]
                 
-                # Sort by Z
                 sort_indices = np.argsort(patch_arr[:, 2])
                 p_sorted = patch_arr[sort_indices]
                 
-                # Основной алгоритм
                 regionwise_ground, regionwise_nonground = extract_piecewiseground(
                     zone_idx, p_sorted, sensor_height, adaptive_seed_selection_margin, num_lpr, num_iter,
                     th_seeds_v, th_dist_v, th_seeds, th_dist, uprightness_thr, enable_RVPF
                 )
                 
-                # Оценка плоскости для GLE (Ground Likelihood Estimation)
                 normal, d, singular_values, pc_mean = estimate_plane(regionwise_ground)
                 
                 ground_uprightness = normal[2]
                 ground_elevation = pc_mean[2]
-                ground_flatness = singular_values[2] # Min singular value (в SVD массив отсортирован по убыванию)
+                ground_flatness = singular_values[2]
                 
-                # Line variable check
                 line_variable = np.inf
                 if singular_values[1] != 0:
                     line_variable = singular_values[0] / singular_values[1]
                 
-                heading = np.dot(pc_mean, normal)
+                # Исправление warning: np.sum вместо np.dot для векторов
+                heading = np.sum(pc_mean * normal)
                 
                 is_upright = ground_uprightness > uprightness_thr
                 is_near_zone = concentric_idx < num_rings_of_interest
@@ -466,40 +395,31 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                     is_not_elevated = ground_elevation < elevation_thr_arr[concentric_idx]
                     is_flat = ground_flatness < flatness_thr_arr[concentric_idx]
                 
-                # Обновление истории (для адаптивных порогов)
                 if is_upright and is_not_elevated and is_near_zone:
                     update_elevation_lists[concentric_idx].append(ground_elevation)
                     update_flatness_lists[concentric_idx].append(ground_flatness)
                     ringwise_flatness.append(ground_flatness)
                 
-                # Принятие решения
                 if not is_upright:
-                    # Не земля
                     for k in range(regionwise_ground.shape[0]):
                         semantic[int(regionwise_ground[k, 3])] = 1
                 elif not is_near_zone:
-                    # Земля (дальняя зона)
                     for k in range(regionwise_ground.shape[0]):
                         semantic[int(regionwise_ground[k, 3])] = 0
                 elif not is_heading_outside:
-                    # Не земля
                     for k in range(regionwise_ground.shape[0]):
                         semantic[int(regionwise_ground[k, 3])] = 1
                 elif is_not_elevated or is_flat:
-                    # Земля
                     for k in range(regionwise_ground.shape[0]):
                         semantic[int(regionwise_ground[k, 3])] = 0
                 else:
-                    # Кандидат на TGR
                     candidates_flatness.append(ground_flatness)
                     candidates_line_var.append(line_variable)
                     candidates_ground_points.append(regionwise_ground)
                 
-                # Не земля из extract_piecewiseground всегда остается не землей
                 for k in range(regionwise_nonground.shape[0]):
                     semantic[int(regionwise_nonground[k, 3])] = 1
 
-            # Конец кольца (Ring) -> TGR проверка
             if len(candidates_flatness) > 0:
                 if enable_TGR:
                     revert_indices = temporal_ground_revert(
@@ -509,7 +429,6 @@ def ground_filter_core(pts, params_tuple, update_elevation_lists, update_flatnes
                     for idx in revert_indices:
                         semantic[idx] = 0
                 
-                # Очистка
                 candidates_flatness.clear()
                 candidates_line_var.clear()
                 candidates_ground_points.clear()
@@ -560,7 +479,6 @@ class PatchWorkpp:
         self.elevation_thr = np.array(params.get('elevation_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         self.flatness_thr = np.array(params.get('flatness_thr', [0.0, 0.0, 0.0, 0.0]), dtype=np.float64)
         
-        # Pre-calc ranges
         min_range_z2 = (7 * self.min_range + self.max_range) / 8.0
         min_range_z3 = (3 * self.min_range + self.max_range) / 4.0
         min_range_z4 = (self.min_range + self.max_range) / 2.0
@@ -580,14 +498,12 @@ class PatchWorkpp:
             2 * math.pi / self.num_sectors_each_zone[3]
         ], dtype=np.float64)
         
-        # История для адаптации (не сохраняется между вызовами в GroundFilterForward, но нужна для структуры)
         self.update_elevation_ = [typed.List.empty_list(float64) for _ in range(4)]
         self.update_flatness_ = [typed.List.empty_list(float64) for _ in range(4)]
 
     def estimateGround(self, cloud_in):
         pts = cloud_in.astype(np.float64)
         
-        # Подготовка типизированных списков для Numba
         update_elev_typed = typed.List()
         for lst in self.update_elevation_:
             update_elev_typed.append(lst)
@@ -611,7 +527,6 @@ class PatchWorkpp:
         
         semantic = ground_filter_core(pts, params_tuple, update_elev_typed, update_flat_typed)
         
-        # Обновление порогов (для совместимости, хотя в режиме stateless не влияет)
         self.update_elevation_ = [lst for lst in update_elev_typed]
         self.update_flatness_ = [lst for lst in update_flat_typed]
         self._update_thr()
@@ -705,6 +620,17 @@ def GroundFilterForward(
         'max_flatness_storage': max_flatness_storage,
         'max_elevation_storage': max_elevation_storage
     }
+    
+    # Автоматическое добавление колонки интенсивности, если её нет
+    if pts.shape[1] == 3:
+        # Создаем массив (N, 4) и заполняем x,y,z, intensity=0
+        temp_pts = np.zeros((pts.shape[0], 4), dtype=np.float32)
+        temp_pts[:, :3] = pts
+        pts = temp_pts
+    elif pts.shape[1] == 4:
+        pass
+    else:
+        raise ValueError(f"Input points must have shape [N, 3] or [N, 4], got {pts.shape}")
     
     valid_mask = np.isfinite(pts).all(axis=1)
     clean_pts = pts[valid_mask]

@@ -67,8 +67,8 @@ if __name__ == "__main__":
                 boxes_3d_ego = snapshot.boxes['boxes']
                 t1 = time.perf_counter_ns()
                 labels = patchworkpp.GroundFilterForward(
-                    pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
-                    # pts=pts_ego, #: np.ndarray,
+                    # pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
+                    pts=pts_ego, #: np.ndarray,
                     verbose=False, #: bool = False,
                     enable_RNR=False,#: bool = True,reflected_noise_removal
                     enable_RVPF=True,#: bool = True,
