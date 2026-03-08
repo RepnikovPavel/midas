@@ -13,6 +13,7 @@ import time
 # import torch
 # import cupy
 import patchworkpp
+import torch
 
 def colorize_point_cloud(
     pts, 
@@ -66,8 +67,9 @@ if __name__ == "__main__":
                 print(f"pts shape {pts_ego.shape}")
                 boxes_3d_ego = snapshot.boxes['boxes']
                 vis.process_events()
+                torch.cuda.synchronize()
                 t1 = time.perf_counter_ns()
-                labels = patchworkpp.GroundFilterForward_fp32_light(
+                labels = patchworkpp.GroundFilterForward_fp32_light_pycuda(
                     # pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
                     pts=pts_ego, #: np.ndarray,
                     verbose=False, #: bool = False,
@@ -94,6 +96,8 @@ if __name__ == "__main__":
                     # max_flatness_storage: int = 1000,
                     # max_elevation_storage: int = 1000
                 )
+                torch.cuda.synchronize()
+
                 t2 = time.perf_counter_ns()
                 print(f"gfpy forward {(t2-t1)/1e6:.2f} ms")
                 print('labels',np.unique(labels,return_counts=True))

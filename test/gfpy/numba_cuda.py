@@ -8,10 +8,10 @@ from visualizer import LidarVisualizer
 import bisect
 from pandaset import PandaDatasetConverted,Sweep,Snapshot
 import time
-# from cuml.cluster import DBSCAN
-# import cudf
-# import torch
-# import cupy
+from cuml.cluster import DBSCAN
+import cudf
+import torch
+import cupy
 import patchworkpp
 
 def colorize_point_cloud(
@@ -67,7 +67,7 @@ if __name__ == "__main__":
                 boxes_3d_ego = snapshot.boxes['boxes']
                 vis.process_events()
                 t1 = time.perf_counter_ns()
-                labels = patchworkpp.GroundFilterForward_fp32_light(
+                labels = patchworkpp.GroundFilterForward_fp32_light_cuda(
                     # pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
                     pts=pts_ego, #: np.ndarray,
                     verbose=False, #: bool = False,

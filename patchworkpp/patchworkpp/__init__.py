@@ -11,3 +11,5 @@ from .codemasks import PatchWorkpp_fp32_masks
 from .light import GroundFilterForward_fp32_light
 from .light import PatchWorkpp_fp32_light
 
+from .pycudafile import GroundFilterForward_fp32_light_pycuda
+from .pycudafile import PatchWorkpp_fp32_light_pycuda

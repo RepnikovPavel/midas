@@ -5,6 +5,5 @@ setup(
     version='0.0.1',
     packages=['patchworkpp'],
     install_requires=[
-        
     ]
 )
