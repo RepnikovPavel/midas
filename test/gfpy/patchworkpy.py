@@ -12,7 +12,7 @@ from cuml.cluster import DBSCAN
 import cudf
 import torch
 import cupy
-import gfpy
+import patchworkpp
 
 def colorize_point_cloud(
     pts, 
@@ -65,10 +65,10 @@ if __name__ == "__main__":
                 pts_ego = snapshot.lidar['points'] # N,3 xyz
                 print(f"pts shape {pts_ego.shape}")
                 boxes_3d_ego = snapshot.boxes['boxes']
-
-                labels = gfpy.ground_filter_forward(
+                t1 = time.perf_counter_ns()
+                labels = patchworkpp.GroundFilterForward(
                     pts=np.concatenate((pts_ego,np.ones(shape=(len(pts_ego),1),dtype=np.float32)),axis=1), #: np.ndarray,
-                    # pts=pts_colors, #: np.ndarray,
+                    # pts=pts_ego, #: np.ndarray,
                     verbose=False, #: bool = False,
                     enable_RNR=False,#: bool = True,reflected_noise_removal
                     enable_RVPF=True,#: bool = True,
@@ -97,6 +97,8 @@ if __name__ == "__main__":
                     # max_flatness_storage: int = 1000,
                     # max_elevation_storage: int = 1000
                 )
+                t2 = time.perf_counter_ns()
+                print(f"gfpy forward {(t2-t1)/1e6:.2f} ms")
                 print('labels',np.unique(labels,return_counts=True))
                 pts_colors = colorize_point_cloud(pts_ego,labels)
                 # if label==0 make red color for this points
