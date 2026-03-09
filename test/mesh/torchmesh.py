@@ -122,7 +122,12 @@ if __name__ == "__main__":
                 vis.process_events()
                 pts_torch = torch.from_numpy(pts_ego).to(torch.float16).contiguous().to('cuda')
                 boxes_torch = torch.from_numpy(boxes_3d_ego).to(torch.float16).contiguous().to('cuda')
+                torch.cuda.synchronize()
+                t1 = time.perf_counter_ns()
                 mask_PB = points_in_boxes(pts_torch,boxes_torch)
+                torch.cuda.synchronize()
+                t2 = time.perf_counter_ns()
+                print(f'points in boxes call {(t2-t1)/1e6:.2f} ms')
                 is_inside_at_least_one_box = torch.any(mask_PB,dim=1)
                 labels_np = is_inside_at_least_one_box.cpu().detach().numpy()
 
