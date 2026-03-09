@@ -127,7 +127,8 @@ if __name__ == "__main__":
                 cluster_colors_np = get_cluster_colors_rgb(cluster_labels_np)
 
 
-                ground_points_colors = colors = np.full((len(ground_points), 3), 128, dtype=np.uint8)
+                ground_points_colors = np.full((len(ground_points), 3), 0, dtype=np.uint8)
+                ground_points_colors[:,1] = 255
 
 
                 all_pts_for_vis = np.concatenate((ground_points,not_ground_points))
@@ -164,7 +165,8 @@ if __name__ == "__main__":
                         },
                         {
                             'plot_type':'boxes',
-                            'data':boxes_3d_ego
+                            'data':boxes_3d_ego,
+                            'colors':np.array([[255,0,0] for _ in range(len(boxes_3d_ego))])
                         }
                     ]
                 )
