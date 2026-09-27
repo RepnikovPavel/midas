@@ -2,31 +2,108 @@
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<title>PandaSet WebGL Viewer</title>
+<title>PandaSet Viewer</title>
 <link rel="stylesheet" href="/static/vendor/leaflet.css">
 <link rel="stylesheet" href="/static/style.css">
 </head>
 <body>
-<div id="main">
-  <div id="view3d-wrap"><canvas id="view3d"></canvas></div>
-  <div id="side">
-    <div id="camgrid"></div>
-    <div id="map"></div>
-    <div id="controls">
-      <button id="btnPlay">Stop</button>
-      <div id="speedo">--.- km/h</div>
-      <label><input type="checkbox" id="chkLidar" checked> LiDAR proj</label>
-      <label><input type="checkbox" id="chkBoxes" checked> Boxes proj</label>
-      <select id="colorMode">
-        <option value="height" selected>height</option>
-        <option value="intensity">intensity</option>
-        <option value="semseg">semseg</option>
-      </select>
-      <select id="sweepSel"></select>
-      <span id="frameLbl">f 0/0</span>
-      <input type="range" id="slider" min="0" max="0" value="0">
+<div id="app">
+
+  <div id="topbar">
+    <span id="logo">PandaSet</span>
+    <label class="tb">sequence <select id="sweepSel"></select></label>
+    <span class="tb mono" id="frameLbl">f 0/0</span>
+    <span class="tb mono" id="tsLbl">ts --</span>
+    <span class="tb mono" id="ptsLbl">pts --</span>
+    <span class="tb mono" id="boxLbl">boxes --</span>
+    <div id="speedo">--.- km/h</div>
+    <span class="tb mono" id="fpsLbl">-- fps</span>
+    <span class="tb mono" id="netLbl"></span>
+    <span class="spacer"></span>
+    <button id="btnHelp" title="keyboard shortcuts (h)">?</button>
+  </div>
+
+  <div id="main">
+    <div id="view3d-wrap">
+      <canvas id="view3d"></canvas>
+
+      <div id="bev-wrap">
+        <div class="panel-hdr">
+          <span>BEV</span>
+          <span id="bevRange">60 m</span>
+        </div>
+        <canvas id="bev" width="640" height="640"></canvas>
+      </div>
+
+      <div id="legend" class="panel">
+        <div class="panel-hdr"><span id="legendTitle">classes</span></div>
+        <div id="legendBody"></div>
+      </div>
+
+      <div id="hud3d" class="panel">
+        <label>point size <input type="range" id="ptSize" min="2" max="20" value="6"></label>
+        <label>range clip <input type="range" id="rangeClip" min="10" max="120" value="120"
+          step="5"><span id="rangeClipLbl">&#8734;</span></label>
+        <label><input type="checkbox" id="chkFrustum" checked> camera frustums</label>
+        <label><input type="checkbox" id="chkGrid" checked> grid</label>
+        <label><input type="checkbox" id="chkLabels3d" checked> box labels</label>
+        <label><input type="checkbox" id="chkBev" checked> BEV radar</label>
+      </div>
+
+      <div id="loading">loading…</div>
+    </div>
+
+    <div id="side">
+      <div id="camgrid"></div>
+      <div id="map"></div>
+      <div id="controls">
+        <button id="btnPrev" title="previous frame (b)">&#9664;</button>
+        <button id="btnPlay">Stop</button>
+        <button id="btnNext" title="next frame (n)">&#9654;</button>
+        <select id="fpsSel" title="playback speed">
+          <option value="0.5">0.5x</option>
+          <option value="1">1x</option>
+          <option value="2">2x</option>
+          <option value="5" selected>5x</option>
+          <option value="10">10x</option>
+        </select>
+        <select id="colorMode">
+          <option value="height" selected>height</option>
+          <option value="intensity">intensity</option>
+          <option value="range">range</option>
+          <option value="semseg">semseg</option>
+        </select>
+        <label><input type="checkbox" id="chkLidar" checked> LiDAR proj</label>
+        <label><input type="checkbox" id="chkBoxes" checked> Boxes proj</label>
+        <label><input type="checkbox" id="chkCamLbl" checked> cam labels</label>
+        <label><input type="checkbox" id="chkFollow" checked> follow map</label>
+        <label title="show all cuboids (no BEV NMS dedup)"><input type="checkbox" id="chkNms" checked> NMS</label>
+        <div id="timeline-wrap">
+          <canvas id="timeline"></canvas>
+          <input type="range" id="slider" min="0" max="0" value="0">
+        </div>
+      </div>
     </div>
   </div>
+
+  <div id="help" hidden>
+    <div id="help-card">
+      <h2>Controls</h2>
+      <table>
+        <tr><td><kbd>Space</kbd></td><td>play / pause</td></tr>
+        <tr><td><kbd>n</kbd> / <kbd>b</kbd></td><td>next / previous frame</td></tr>
+        <tr><td><kbd>N</kbd> / <kbd>B</kbd></td><td>next / previous sequence</td></tr>
+        <tr><td><kbd>c</kbd></td><td>cycle point color mode</td></tr>
+        <tr><td><kbd>h</kbd></td><td>toggle this help</td></tr>
+        <tr><td><kbd>mouse</kbd></td><td>3D: orbit / wheel zoom; camera panes: wheel zoom to cursor, drag to pan</td></tr>
+        <tr><td><kbd>map</kbd></td><td>click on the GPS track to jump to the nearest frame</td></tr>
+        <tr><td><kbd>legend</kbd></td><td>click a class chip to show/hide that object class</td></tr>
+      </table>
+      <p>Ego frame: X forward, Y left, Z up. Boxes: x y z dx dy dz yaw.</p>
+      <button id="btnHelpClose">close</button>
+    </div>
+  </div>
+
 </div>
 <script src="/static/vendor/three.min.js"></script>
 <script src="/static/vendor/OrbitControls.js"></script>

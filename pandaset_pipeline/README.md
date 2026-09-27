@@ -43,6 +43,19 @@ SERVER_PASS=... bash deploy/server_setup.sh
 ```
 
 Образ: `docker/pipeline/Dockerfile` (python:3.12-slim + numpy/pandas/numba).
+
+Контроль завершённости скачивания (после остановки контейнера):
+
+```bash
+ssh user@192.168.0.1 'docker run --rm \
+  -v /home/user/pandaset_pipeline/src/pandaset_pipe:/app/pandaset_pipe:ro \
+  --mount type=bind,src=/mnt/hdd1/datasets,target=/mnt/hdd1/datasets \
+  --mount type=bind,src=/mnt/hdd2/datasets,target=/mnt/hdd2/datasets \
+  pandaset-pipeline:latest python -m pandaset_pipe.verify \
+  --zip-index /mnt/hdd1/datasets/pandaset_work/zip_index.json'
+# raw: 74445 files, missing=0, badsize=0; npz: 103 seq, 8240 lidar frames → VERDICT: OK
+```
+
 Валидация осей на сырых данных:
 
 ```bash
@@ -59,7 +72,28 @@ ssh user@192.168.0.1 'sudo bash -s' < deploy/nfs_server_setup.sh
 sudo bash deploy/client_mount.sh     # /mnt/server/hdd{1,2}
 ```
 
-## Просмотр (клиент, X11)
+## Просмотр
+
+### Web-визуализатор (рекомендуется)
+
+```bash
+bash docker/viz/build.sh
+bash docker/viz/run_web.sh                 # контейнер сам монтирует NFS сервера
+# открыть http://localhost:8777  (deep-link: /?seq=001&frame=40)
+```
+
+Возможности: 3D-облако (turbo-колорация по высоте / интенсивность / дальность /
+семсег), класс-цветные 3D-боксы с подписями и фильтрами классов, фрустумы камер,
+BEV-радар с дальномерными кольцами, проекция точек и боксов на 6 камер (зум
+колесом к курсору), OSM-карта с GPS-треком (клик по треку → переход к кадру),
+таймлайн профиля скорости, скорость воспроизведения 0.5–10x, NMS on/off,
+range-clip и размер точек. Горячие клавиши: `space` `n/b` (кадр) `N/B` (секвенция)
+`c` (режим цвета) `h` (справка).
+
+Бэкенд: `pandaset_pipe.webserver` (aiohttp) — бинарный протокол кадра
+(~2 МБ/кадр), `/api/frame /api/meta /api/gps_track /api/camimg`.
+
+### Десктоп (PyQt5/vispy, X11)
 
 ```bash
 bash docker/viz/build.sh

@@ -38,10 +38,17 @@ class State:
                 self.data = json.load(f)
         except OSError:
             self.data = {"downloaded": {}, "converted": {}, "failed": {}}
+        # drop stale failure records for sequences that later succeeded
+        for s in list(self.data.get("failed", {})):
+            if s in self.data.get("downloaded", {}):
+                del self.data["failed"][s]
 
     def mark(self, kind, seq, info=True):
         with self.lock:
             self.data[kind][seq] = info
+            if kind == "downloaded":
+                # a later success supersedes any earlier failure record
+                self.data["failed"].pop(seq, None)
             self._save()
 
     def _save(self):
@@ -230,7 +237,9 @@ def run(url, disks, workdir, streams=16, chunk_mb=16, auth_header=None, proxy=No
         for t in conv_threads:
             t.join(timeout=5)
 
-    n_fail = len(state.data["failed"])
+    # only failures that never succeeded afterwards count as real failures
+    n_fail = len([s for s in state.data["failed"]
+                  if s not in state.data["downloaded"]])
     _log(f"DONE. downloaded={len(state.data['downloaded'])} "
          f"converted={len(state.data['converted'])} failed={n_fail}")
     return 0 if n_fail == 0 else 2

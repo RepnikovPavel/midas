@@ -16,7 +16,8 @@ RUN pip install --no-cache-dir -i ${PIP_INDEX_URL} \
         numpy pandas numba tqdm \
         vispy PyQt5 glfw \
         opencv-python-headless \
-        smopy Pillow
+        smopy Pillow \
+        aiohttp
 
 WORKDIR /app
 # build context = midas repo root
