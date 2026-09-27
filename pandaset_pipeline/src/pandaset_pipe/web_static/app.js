@@ -473,6 +473,11 @@ for (let i = 0; i < 256; i++) {
 }
 
 const EDGES = [[0,1],[1,2],[2,3],[3,0],[4,5],[5,6],[6,7],[7,4],[0,4],[1,5],[2,6],[3,7]];
+const BOX_SIGNS = [[-.5,-.5,-.5],[.5,-.5,-.5],[.5,.5,-.5],[-.5,.5,-.5],
+                   [-.5,-.5,.5],[.5,-.5,.5],[.5,.5,.5],[-.5,.5,.5]];
+function colorFor(label) {
+  return state.classColors[label] || (state.classColors[label] = classColor(label));
+}
 function boxCorners(b) {
   const x = b[0], y = b[1], z = b[2], dx = b[3], dy = b[4], dz = b[5], yaw = b[6];
   const c = Math.cos(yaw), s = Math.sin(yaw), out = new Float32Array(24);
@@ -990,21 +995,49 @@ function renderCamPanel(p, data) {
   p.pts.visible = state.showLidar && mm > 0;
 
   // ---- box frames + labels: 2D overlay (thick, crisp, aligned) ----
+  // Cameras run at their own timestamps: cd.ib holds boxes interpolated onto
+  // THIS camera's ts (world frame + ego pose at that ts) — project those;
+  // fall back to the shared lidar-frame boxes if interpolation is absent.
   const ctx = p.octx;
   ctx.clearRect(0, 0, w0, h0);
   if (state.showBoxes) {
-    const scale = 1 / Math.max(p.fit * p.z.s, 1e-3);   // constant screen px size
-    const lw = Math.max(1.2, 2.6 * scale);
-    const fs = Math.max(8, 12 * scale);
-    const idx = visibleBoxes(data);
-    const labels = data.header.labels, cols = classColorsFor(labels);
+    const uiScale = 1 / Math.max(p.fit * p.z.s, 1e-3);   // constant screen px size
+    const lw = Math.max(1.2, 2.6 * uiScale);
+    const fs = Math.max(8, 12 * uiScale);
+    const items = [];
+    if (cd.ib) {
+      const Rw2e = quatToMat(cd.ib_e2g.slice(3, 7));   // world_from_ego @ t_cam
+      const tw = cd.ib_e2g.slice(0, 3);
+      for (let k = 0; k < cd.ib.length; k++) {
+        const lab = cd.ib_labels[k] || "?";
+        if (!boxVisible(lab)) continue;
+        const b = cd.ib[k];
+        const cs = Math.cos(b[6]), sn = Math.sin(b[6]);
+        const cor = new Float32Array(24);
+        for (let i = 0; i < 8; i++) {
+          const lx = BOX_SIGNS[i][0] * b[3], ly = BOX_SIGNS[i][1] * b[4],
+                lz = BOX_SIGNS[i][2] * b[5];
+          const wx = cs * lx - sn * ly + b[0];
+          const wy = sn * lx + cs * ly + b[1];
+          const wz = lz + b[2];
+          const dx = wx - tw[0], dy = wy - tw[1], dz = wz - tw[2];
+          cor[i*3]   = Rw2e[0][0]*dx + Rw2e[1][0]*dy + Rw2e[2][0]*dz;
+          cor[i*3+1] = Rw2e[0][1]*dx + Rw2e[1][1]*dy + Rw2e[2][1]*dz;
+          cor[i*3+2] = Rw2e[0][2]*dx + Rw2e[1][2]*dy + Rw2e[2][2]*dz;
+        }
+        items.push({ cor, lab });
+      }
+    } else {
+      const labels = data.header.labels;
+      for (const k of visibleBoxes(data))
+        items.push({ cor: boxCorners(data.boxes.subarray(k * 7, k * 7 + 7)),
+                     lab: labels[k] || "?" });
+    }
     ctx.lineWidth = lw;
     ctx.font = `bold ${fs}px system-ui`;
     ctx.textBaseline = "bottom";
-    for (const k of idx) {
-      const b = data.boxes.subarray(k*7, k*7+7);
-      const cor = boxCorners(b);
-      // project corners -> raw image px (u, v)
+    for (const it of items) {
+      const cor = it.cor;
       const uvs = new Array(8);
       let zmin = Infinity;
       for (let i = 0; i < 8; i++) {
@@ -1017,11 +1050,10 @@ function renderCamPanel(p, data) {
         if (cz < zmin) zmin = cz;
       }
       if (zmin < 0.2 || uvs.some(q => !q)) continue;
-      // skip boxes fully outside the frame
       let inside = false;
       for (const q of uvs) if (q[0] >= -50 && q[0] <= w0 + 50 && q[1] >= -50 && q[1] <= h0 + 50) inside = true;
       if (!inside) continue;
-      const css = cols[k].css;
+      const css = colorFor(it.lab).css;
       ctx.strokeStyle = css;
       ctx.beginPath();
       for (const [a, bb] of EDGES) {
@@ -1032,15 +1064,15 @@ function renderCamPanel(p, data) {
       if (state.showCamLbl) {
         let top = uvs[4];
         for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];
-        const text = labels[k] || "?";
-        const tw = ctx.measureText(text).width;
-        const pad = 3 * scale;
-        const x = Math.min(Math.max(top[0], tw / 2 + 2), w0 - tw / 2 - 2);
-        const y = Math.max(top[1] - 4 * scale, fs);
+        const text = it.lab;
+        const tw2 = ctx.measureText(text).width;
+        const pad = 3 * uiScale;
+        const x = Math.min(Math.max(top[0], tw2 / 2 + 2), w0 - tw2 / 2 - 2);
+        const y = Math.max(top[1] - 4 * uiScale, fs);
         ctx.fillStyle = "rgba(0,0,0,0.6)";
-        ctx.fillRect(x - tw / 2 - pad, y - fs - pad * 0.5, tw + pad * 2, fs + pad);
+        ctx.fillRect(x - tw2 / 2 - pad, y - fs - pad * 0.5, tw2 + pad * 2, fs + pad);
         ctx.fillStyle = css;
-        ctx.fillText(text, x - tw / 2, y);
+        ctx.fillText(text, x - tw2 / 2, y);
       }
     }
   }

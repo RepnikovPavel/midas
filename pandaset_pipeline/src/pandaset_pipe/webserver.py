@@ -25,6 +25,97 @@ OSM_UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 UA = "pandaset-pipeline-viewer/1.0"
 
 
+def _quat_slerp(q0, q1, a):
+    """Quaternion slerp (wxyz), numpy."""
+    q0 = np.asarray(q0, float) / np.linalg.norm(q0)
+    q1 = np.asarray(q1, float) / np.linalg.norm(q1)
+    d = float(np.dot(q0, q1))
+    if d < 0:
+        q1, d = -q1, -d
+    if d > 0.9995:
+        q = q0 + a * (q1 - q0)
+        return q / np.linalg.norm(q)
+    th = np.arccos(np.clip(d, -1, 1))
+    return (np.sin((1 - a) * th) * q0 + np.sin(a * th) * q1) / np.sin(th)
+
+
+def _interp_cam_boxes(sw, ts_cam, use_nms=True, max_gap_ms=150):
+    """Boxes + ego pose interpolated onto a camera's own timestamp.
+
+    Cameras are not synchronized with the lidar: projecting lidar-frame boxes
+    onto a camera image shows a motion offset. Boxes (matched by uuid) are
+    interpolated linearly in the world frame between the surrounding lidar
+    frames; the ego pose is lerped/slerped the same way.
+
+    Returns (boxes, labels, e2g) where boxes is (M,7) [x y z_world dx dy dz
+    yaw_world] and e2g is [tx ty tz qw qx qy qz] at ts_cam.
+    """
+    import bisect
+    ts = sw.timestamps
+    n = len(ts)
+    if n == 0:
+        return None
+    i = bisect.bisect_left(ts, ts_cam)
+    j1 = min(max(i, 0), n - 1)
+    j0 = min(max(i - 1, 0), n - 1)
+    if j1 == j0:
+        a = 0.0
+    else:
+        a = (ts_cam - ts[j0]) / (ts[j1] - ts[j0])
+        a = min(max(a, 0.0), 1.0)
+
+    def load(j):
+        p = os.path.join(sw.path, f"boxes_{ts[j]}.npz")
+        if not os.path.exists(p):
+            return None
+        d = np.load(p, allow_pickle=True)
+        t = d["ego2global_translation"].astype(np.float64)
+        q = d["ego2global_rotation"].astype(np.float64)
+        yaw = np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
+                         1 - 2 * (q[2] ** 2 + q[3] ** 2))
+        b = d["boxes"].astype(np.float64)
+        labels = d["class_names"]
+        uuids = d["uuids"]
+        if use_nms and "nms_keep" in d.files:
+            keep = d["nms_keep"].astype(bool)
+            b, labels, uuids = b[keep], labels[keep], uuids[keep]
+        out = {}
+        for k in range(len(b)):
+            pw = np.array([b[k, 0], b[k, 1], b[k, 2], 1.0])
+            # ego2global with yaw-only rotation is not enough for z; use full Rz:
+            # box centers are near ground so Rz approximation is fine for x,y
+            c, s = np.cos(yaw), np.sin(yaw)
+            Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+            cen = Rz @ b[k, :3] + t
+            out[str(uuids[k])] = (cen, b[k, 3], b[k, 4], b[k, 5],
+                                  b[k, 6] + yaw, str(labels[k]))
+        return out, t, q
+
+    L0 = load(j0)
+    L1 = load(j1)
+    if L0 is None and L1 is None:
+        return None
+    if L0 is None:
+        L0 = L1
+    if L1 is None:
+        L1 = L0
+    b0, t0, q0 = L0
+    b1, t1, q1 = L1
+    e2g = np.concatenate([t0 + a * (t1 - t0), _quat_slerp(q0, q1, a)])
+    boxes, labels = [], []
+    for uuid, (c0, dx, dy, dz, yaw0, lab) in b0.items():
+        if uuid in b1:
+            c1, _, _, _, yaw1, _ = b1[uuid]
+            cen = c0 + a * (c1 - c0)
+            dyaw = (yaw1 - yaw0 + np.pi) % (2 * np.pi) - np.pi
+            yaw = yaw0 + a * dyaw
+        else:
+            cen, yaw = c0, yaw0
+        boxes.append([cen[0], cen[1], cen[2], dx, dy, dz, yaw])
+        labels.append(lab)
+    return np.array(boxes, dtype=np.float64), labels, e2g.tolist()
+
+
 def make_app(roots, osm_dir=None):
     ds = PandaDataset(roots)
     if len(ds) == 0:
@@ -138,6 +229,13 @@ def make_app(roots, osm_dir=None):
                 "w": int(entry["image"].shape[1]),
                 "h": int(entry["image"].shape[0]),
             }
+            # boxes interpolated onto THIS camera's own timestamp (async sensors)
+            ib = _interp_cam_boxes(sw, ts_cam, use_nms=use_nms)
+            if ib is not None:
+                boxes_c, labels_c, e2g_c = ib
+                cams[cam]["ib"] = boxes_c.astype(float).tolist()
+                cams[cam]["ib_labels"] = labels_c
+                cams[cam]["ib_e2g"] = e2g_c
         header = {
             "ts": snap.ts, "n": len(pts), "nb": len(boxes),
             "labels": [str(x) for x in labels],
