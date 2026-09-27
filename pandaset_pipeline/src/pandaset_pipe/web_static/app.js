@@ -76,6 +76,23 @@ function classColorsFor(labels) {
 // ------------------------------------------------------------ data
 async function api(path) { const r = await fetch(path); return r.json(); }
 
+// fp16 -> fp32 (points arrive half-size over the wire); proper bit conversion
+const F16_SCALE = [];
+for (let e = 0; e <= 30; e++) F16_SCALE[e] = Math.pow(2, e - 15);
+const F16_SUB = Math.pow(2, -24);
+function decodeF16(bits, n) {
+  const out = new Float32Array(n);
+  for (let i = 0; i < n; i++) {
+    const h = bits[i];
+    const e = (h & 0x7c00) >> 10;
+    const m = h & 0x03ff;
+    if (e === 0) out[i] = (h & 0x8000 ? -1 : 1) * m * F16_SUB;
+    else if (e === 31) out[i] = m ? NaN : (h & 0x8000 ? -Infinity : Infinity);
+    else out[i] = (h & 0x8000 ? -1 : 1) * (m / 1024 + 1) * F16_SCALE[e];
+  }
+  return out;
+}
+
 async function loadFrame(sweep, frame) {
   const key = `${sweep}:${frame}:${state.showNms ? 1 : 0}`;
   if (state.cache.has(key)) return state.cache.get(key);
@@ -88,9 +105,20 @@ async function loadFrame(sweep, frame) {
     const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, jl)));
     let off = 4 + jl;
     const n = header.n, nb = header.nb;
-    const points = new Float32Array(buf.slice(off, off + n * 12)); off += n * 12;
-    const intensity = new Uint8Array(buf.slice(off, off + n)); off += n;
-    const semseg = new Uint8Array(buf.slice(off, off + n)); off += n;
+    let points;
+    if (header.pts_dtype === "float16") {
+      const bytes = n * 6;
+      const src = (off & 1) === 0
+        ? new Uint16Array(buf, off, n * 3)
+        : new Uint16Array(buf.slice(off, off + bytes));
+      points = decodeF16(src, n * 3);
+      off += bytes;
+    } else {
+      points = new Float32Array(buf.slice(off, off + n * 12));
+      off += n * 12;
+    }
+    const intensity = new Uint8Array(buf, off, n); off += n;
+    const semseg = new Uint8Array(buf, off, n); off += n;
     const boxes = new Float32Array(buf.slice(off, off + nb * 28));
     state.netKB += buf.byteLength / 1024;
     state.lastLoadMs = performance.now() - t0;
@@ -142,6 +170,8 @@ function rangeMask(data) {
 }
 
 function clippedPoints(data, colors) {
+  const ck = "cp:" + state.colorMode + ":" + state.rangeClip;
+  if (data.colors[ck]) return data.colors[ck];
   const m = rangeMask(data), pts = data.points, n = data.header.n;
   let c = 0; for (let i = 0; i < n; i++) c += m[i];
   const pos = new Float32Array(c * 3), col = new Float32Array(c * 3);
@@ -151,7 +181,9 @@ function clippedPoints(data, colors) {
     col[j * 3] = colors[i * 3]; col[j * 3 + 1] = colors[i * 3 + 1]; col[j * 3 + 2] = colors[i * 3 + 2];
     j++;
   }
-  return { pos, col, n: c };
+  const out = { pos, col, n: c };
+  data.colors[ck] = out;
+  return out;
 }
 
 function boxVisible(label) { return !state.hiddenClasses.has(label); }
@@ -165,52 +197,27 @@ function quatToMat(q) {
 }
 
 // ------------------------------------------------------------ OSM tiles
-// Tiles (c) OpenStreetMap contributors; positioned via GPS<->world alignment.
+// Tiles (c) OpenStreetMap contributors; served pre-downloaded from the
+// pipeline (pandaset_pipe.osmtiles) via /api/tile and positioned via the
+// GPS<->world alignment. One trip-wide canvas per sequence: pre-rendered with
+// margin over the whole route, then moved along the trajectory per frame.
 const R_EARTH = 6378137, CIRC = 2 * Math.PI * R_EARTH;
-const TILE_Z = 18;
-const tiles = { img: new Map(), stitch: new Map() };
+const tiles = { img: new Map() };
 
 function tileImg(z, x, y) {
   const k = z + "/" + x + "/" + y;
   let t = tiles.img.get(k);
   if (!t) {
     t = { img: new Image(), ok: false };
-    t.img.crossOrigin = "anonymous";
     t.img.onload = () => { t.ok = true; requestRender(); };
-    t.img.src = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+    t.img.src = `/api/tile/${z}/${x}/${y}.png`;
     tiles.img.set(k, t);
-    if (tiles.img.size > 120) {  // simple LRU trim
+    if (tiles.img.size > 600) {  // simple LRU trim
       const first = tiles.img.keys().next().value;
       tiles.img.delete(first);
     }
   }
   return t;
-}
-
-// stitched N x N tile canvas with (x0,y0) as the top-left tile
-function stitched(z, x0, y0, N) {
-  const key = z + "/" + x0 + "/" + y0 + "/" + N;
-  let s = tiles.stitch.get(key);
-  if (!s) {
-    const c = document.createElement("canvas");
-    c.width = N * 256; c.height = N * 256;
-    s = { canvas: c, x0, y0, z, n: N, painted: new Set(), lastPainted: 0 };
-    tiles.stitch.set(key, s);
-    if (tiles.stitch.size > 8) tiles.stitch.delete(tiles.stitch.keys().next().value);
-  }
-  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
-    const kk = i + "," + j;
-    if (s.painted.has(kk)) continue;
-    const t = tileImg(z, x0 + i, y0 + j);
-    if (t.ok) {
-      s.canvas.getContext("2d").drawImage(t.img, i * 256, j * 256);
-      s.painted.add(kk);
-    }
-  }
-  s.dirty = s.painted.size !== s.lastPainted;
-  s.lastPainted = s.painted.size;
-  s.ready = s.painted.size === N * N;
-  return s;
 }
 
 function lon2px(lon, z) { return ((lon / 360 + 0.5) * 256 * 2 ** z); }
@@ -229,39 +236,98 @@ function frameGeo(header) {
   const tw = header.e2g.slice(0, 3);             // ego position in world
   const cA = Math.cos(aln.rot), sA = Math.sin(aln.rot);
   const ca = Math.cos(aln.lat0 * Math.PI / 180);
-  const mx0 = gpx2mx(lon2px(aln.lon0, TILE_Z), TILE_Z);
-  const my0 = gpx2my(lat2py(aln.lat0, TILE_Z), TILE_Z);
-  const zw = tw[2] - 1.7;                        // world z of the ground plane
+  const mx0 = gpx2mx(lon2px(aln.lon0, 0), 0);
+  const my0 = gpx2my(lat2py(aln.lat0, 0), 0);
   function map(e, n) {
     const de = e - aln.t[0], dn = n - aln.t[1];
     const x = ( cA * de + sA * dn) / aln.s;
     const y = (-sA * de + cA * dn) / aln.s;
-    const dx = x - tw[0], dy = y - tw[1], dz = zw - tw[2];
-    return [R[0][0]*dx + R[1][0]*dy + R[2][0]*dz,
-            R[0][1]*dx + R[1][1]*dy + R[2][1]*dz,
-            R[0][2]*dx + R[1][2]*dy + R[2][2]*dz];
+    const dx = x - tw[0], dy = y - tw[1];
+    return [R[0][0]*dx + R[1][0]*dy,
+            R[0][1]*dx + R[1][1]*dy,
+            R[0][2]*dx + R[1][2]*dy];
   }
-  // ego ENU position (for locating tiles)
+  // ego ENU position (for the marker / debugging)
   const eE = aln.s * (cA * tw[0] - sA * tw[1]) + aln.t[0];
   const nE = aln.s * (sA * tw[0] + cA * tw[1]) + aln.t[1];
   return { aln, ca, mx0, my0, map, eE, nE };
 }
 
-// stitched tiles around the ego position, geo helpers attached
-function mapPatch(header, N) {
+// ---- trip-wide map: one canvas per sequence, pre-rendered over the route ----
+const PLAN_MARGIN = 120, PLAN_MAX_PX = 3840, PLAN_ZMIN = 15, PLAN_ZMAX = 18;
+let tripMap = null;   // {canvas, plan, eTL, nTL, mPerPx, painted, paintedCount, total, tex, lastUpload}
+
+function computePlanFallback(aln) {
+  // mirrors pandaset_pipe.osmtiles.sweep_plan (used only if the plan file is absent)
+  const tr = state.track, ca = Math.cos(aln.lat0 * Math.PI / 180);
+  let e0 = 1e18, e1 = -1e18, n0 = 1e18, n1 = -1e18;
+  for (let i = 0; i < tr.lat.length; i++) {
+    if (!tr.lat[i] && !tr.lon[i]) continue;
+    const e = (tr.lon[i] - aln.lon0) * Math.PI / 180 * R_EARTH * ca;
+    const n = (tr.lat[i] - aln.lat0) * Math.PI / 180 * R_EARTH;
+    if (e < e0) e0 = e; if (e > e1) e1 = e;
+    if (n < n0) n0 = n; if (n > n1) n1 = n;
+  }
+  e0 -= PLAN_MARGIN; e1 += PLAN_MARGIN; n0 -= PLAN_MARGIN; n1 += PLAN_MARGIN;
+  const mpp = z => CIRC * ca / (256 * 2 ** z);
+  let z = PLAN_ZMAX;
+  while (z > PLAN_ZMIN && Math.max(e1 - e0, n1 - n0) / mpp(z) > PLAN_MAX_PX) z--;
+  const lonAt = e => aln.lon0 + e / (R_EARTH * ca) * 180 / Math.PI;
+  const latAt = n => aln.lat0 + n / R_EARTH * 180 / Math.PI;
+  const px0 = lon2px(lonAt(e0), z), px1 = lon2px(lonAt(e1), z);
+  const py0 = lat2py(latAt(n1), z), py1 = lat2py(latAt(n0), z);
+  const x0 = Math.floor(px0 / 256), x1 = Math.floor((px1 - 1e-6) / 256);
+  const y0 = Math.floor(py0 / 256), y1 = Math.floor((py1 - 1e-6) / 256);
+  return { z, x0, y0, ntx: x1 - x0 + 1, nty: y1 - y0 + 1,
+           lat0: aln.lat0, lon0: aln.lon0 };
+}
+
+async function buildTripMap() {
+  const aln = state.track && state.track.aln;
+  if (!aln) { tripMap = null; return; }
+  let plan = null;
+  try { plan = await api(`/api/osm_plan?sweep=${state.sweep}`); } catch (e) { /* offline */ }
+  if (!plan || !plan.z) plan = computePlanFallback(aln);
+  const canvas = document.createElement("canvas");
+  canvas.width = plan.ntx * 256;
+  canvas.height = plan.nty * 256;
+  if (tripMap && tripMap.tex) tripMap.tex.dispose();
+  const ca = Math.cos(plan.lat0 * Math.PI / 180);
+  tripMap = {
+    canvas, plan, painted: new Set(), paintedCount: 0,
+    total: plan.ntx * plan.nty, tex: null, lastUpload: 0,
+    mPerPx: CIRC * ca / (256 * 2 ** plan.z),
+    eTL: (gpx2mx(plan.x0 * 256, plan.z) - gpx2mx(lon2px(plan.lon0, plan.z), plan.z)) * ca,
+    nTL: (gpx2my(plan.y0 * 256, plan.z) - gpx2my(lat2py(plan.lat0, plan.z), plan.z)) * ca,
+  };
+}
+
+function paintTrip() {  // progressively paint newly loaded tiles; true if changed
+  const tm = tripMap;
+  if (!tm || tm.paintedCount === tm.total) return false;
+  const ctx = tm.canvas.getContext("2d"), p = tm.plan;
+  let changed = false;
+  for (let i = 0; i < p.ntx; i++) for (let j = 0; j < p.nty; j++) {
+    const kk = i + "," + j;
+    if (tm.painted.has(kk)) continue;
+    const t = tileImg(p.z, p.x0 + i, p.y0 + j);
+    if (t.ok) {
+      ctx.drawImage(t.img, i * 256, j * 256);
+      tm.painted.add(kk);
+      tm.paintedCount++;
+      changed = true;
+    }
+  }
+  return changed;
+}
+
+// map patch for the current frame: trip canvas + geo mapping
+function mapPatch(header) {
   const g = frameGeo(header);
-  if (!g) return null;
-  const lon = g.aln.lon0 + g.eE / (R_EARTH * g.ca);
-  const lat = g.aln.lat0 + g.nE / R_EARTH;
-  const px = lon2px(lon, TILE_Z), py = lat2py(lat, TILE_Z);
-  const cx = Math.floor(px / 256), cy = Math.floor(py / 256);
-  const s = stitched(TILE_Z, cx - (N >> 1), cy - (N >> 1), N);
-  // stitched canvas top-left in ENU meters
-  const x0 = s.x0 * 256, y0 = s.y0 * 256;
-  const eTL = (gpx2mx(x0, TILE_Z) - g.mx0) * g.ca;
-  const nTL = (gpx2my(y0, TILE_Z) - g.my0) * g.ca;
-  const mPerPx = CIRC * g.ca / (256 * 2 ** TILE_Z);
-  return { g, s, eTL, nTL, mPerPx };
+  if (!g || !tripMap) return null;
+  const changed = paintTrip();
+  return { g, canvas: tripMap.canvas, eTL: tripMap.eTL, nTL: tripMap.nTL,
+           mPerPx: tripMap.mPerPx, changed };
 }
 
 // ------------------------------------------------------------ 3D scene
@@ -287,7 +353,6 @@ const mapPlane = new THREE.Mesh(
                                 side: THREE.DoubleSide }));
 mapPlane.visible = false;
 scene3.add(mapPlane);
-let mapTexKey = null, mapTex = null;
 
 // ego vehicle wireframe (X fwd)
 {
@@ -430,26 +495,30 @@ function render3d(data) {
 
   grid3.visible = state.showGrid;
 
-  // ---- OSM map on the ground plane ----
+  // ---- OSM map on the ground plane (trip-wide canvas) ----
   if (state.showMap3d) {
-    const mp = mapPatch(data.header, 2);
+    const mp = mapPatch(data.header);
     if (mp) {
-      const Wpx = mp.s.canvas.width, Hpx = mp.s.canvas.height;
+      const Wpx = mp.canvas.width, Hpx = mp.canvas.height;
       // flatten in the EGO frame (same projection the BEV uses): the pandaset
       // world frame is not gravity-aligned, so a world-horizontal plane would
-      // appear tilted ~2-4 deg; take (x, y) only and pin z to the local ground
+      // appear tilted; take (x, y) only and pin z to the local ground
       const gz = groundLevel(data);
       const c00 = mp.g.map(mp.eTL, mp.nTL); c00[2] = gz;
       const c10 = mp.g.map(mp.eTL + Wpx * mp.mPerPx, mp.nTL); c10[2] = gz;
       const c01 = mp.g.map(mp.eTL, mp.nTL - Hpx * mp.mPerPx); c01[2] = gz;
-      const key = TILE_Z + "/" + mp.s.x0 + "/" + mp.s.y0;
-      if (mapTexKey !== key || mp.s.dirty) {
-        if (mapTex) mapTex.dispose();
-        mapTex = new THREE.CanvasTexture(mp.s.canvas);
-        mapTex.flipY = false;
-        mapTexKey = key;
+      // texture: one per trip canvas; refresh (throttled) while tiles arrive
+      const tm = tripMap;
+      if (!tm.tex) {
+        tm.tex = new THREE.CanvasTexture(tm.canvas);
+        tm.tex.flipY = false;
+        tm.lastUpload = performance.now();
+      } else if (mp.changed && (tm.paintedCount === tm.total ||
+                                performance.now() - tm.lastUpload > 400)) {
+        tm.tex.needsUpdate = true;
+        tm.lastUpload = performance.now();
       }
-      mapPlane.material.map = mapTex;
+      mapPlane.material.map = tm.tex;
       mapPlane.material.needsUpdate = true;
       const u = [c10[0] - c00[0], c10[1] - c00[1], c10[2] - c00[2]];
       const v = [c01[0] - c00[0], c01[1] - c00[1], c01[2] - c00[2]];
@@ -476,6 +545,7 @@ const bev = $("bev"), bevCtx = bev.getContext("2d");
 const bevPtsCv = document.createElement("canvas");
 bevPtsCv.width = bev.width; bevPtsCv.height = bev.height;
 const bevPtsCtx = bevPtsCv.getContext("2d");
+let bevImgData = null;                     // reused point buffer (no per-frame alloc)
 const bevView = { z: 1, x: 0, y: 0 };   // zoom factor + pan px
 const BEV_BASE_R = 60;                   // meters radius at zoom 1
 
@@ -486,21 +556,21 @@ function renderBev(data) {
   bevCtx.fillStyle = "#080b0e";
   bevCtx.fillRect(0, 0, W, W);
 
-  // ---- OSM underlay ----
+  // ---- OSM underlay (trip-wide canvas) ----
   if (state.showMapBev) {
-    const mp = mapPatch(data.header, 3);
+    const mp = mapPatch(data.header);
     if (mp) {
       const [sx0, sy0] = px(...mp.g.map(mp.eTL, mp.nTL).slice(0, 2));
-      const [sx1, sy1] = px(...mp.g.map(mp.eTL + mp.s.canvas.width * mp.mPerPx, mp.nTL).slice(0, 2));
-      const [sx2, sy2] = px(...mp.g.map(mp.eTL, mp.nTL - mp.s.canvas.height * mp.mPerPx).slice(0, 2));
-      const w = mp.s.canvas.width, h = mp.s.canvas.height;
+      const [sx1, sy1] = px(...mp.g.map(mp.eTL + mp.canvas.width * mp.mPerPx, mp.nTL).slice(0, 2));
+      const [sx2, sy2] = px(...mp.g.map(mp.eTL, mp.nTL - mp.canvas.height * mp.mPerPx).slice(0, 2));
+      const w = mp.canvas.width, h = mp.canvas.height;
       const a = (sx1 - sx0) / w, b = (sy1 - sy0) / w;
       const c = (sx2 - sx0) / h, d = (sy2 - sy0) / h;
       if ((a * a + b * b) > 1e-12) {
         bevCtx.save();
         bevCtx.setTransform(a, b, c, d, sx0, sy0);
         bevCtx.globalAlpha = 0.85;
-        bevCtx.drawImage(mp.s.canvas, 0, 0);
+        bevCtx.drawImage(mp.canvas, 0, 0);
         bevCtx.restore();
         bevCtx.setTransform(1, 0, 0, 1, 0, 0);
       }
@@ -526,8 +596,10 @@ function renderBev(data) {
   // ---- points (offscreen ImageData, composed over the map) ----
   const colors = pointColors(data, state.colorMode, state.rangeClip);
   const m = rangeMask(data), pts = data.points, n = data.header.n;
-  const img = bevPtsCtx.createImageData(W, W);
-  const d = img.data;
+  if (!bevImgData || bevImgData.width !== W)
+    bevImgData = bevPtsCtx.createImageData(W, W);
+  const img = bevImgData, d = img.data;
+  d.fill(0);
   for (let i = 0; i < n; i++) {
     if (!m[i]) continue;
     const pxx = (cx + bevView.x - pts[i * 3 + 1] * scale) | 0;
@@ -958,6 +1030,7 @@ async function selectSweep(i, frame = 0) {
   buildCamPanels(meta.cameras);
   buildClasses();
   state.track = track;
+  await buildTripMap();
   const pts = [];
   for (let k = 0; k < track.lat.length; k++)
     if (track.lat[k] || track.lon[k]) pts.push([track.lat[k], track.lon[k]]);
@@ -1092,6 +1165,9 @@ window.addEventListener("keydown", e => {
   } else if (e.key === "h" || e.key === "?") $("help").hidden = !$("help").hidden;
   else if (e.key === "Escape") { $("help").hidden = true; $("classes-pop").hidden = true; }
 });
+
+// debugging aid (browser console)
+window.__pandaset = { state, loadFrame, mapPatch, frameGeo, tripMap: () => tripMap };
 
 // ------------------------------------------------------------ init
 (async function init() {

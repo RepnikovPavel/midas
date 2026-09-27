@@ -1,9 +1,15 @@
 """Web backend for the PandaSet viewer (serves frontend + frame data).
 
-Run:  python -m pandaset_pipe.webserver --roots R1 R2 --port 8777
+Run:  python -m pandaset_pipe.webserver --roots R1 R2 --port 8777 [--osm-dir DIR]
 Open: http://localhost:8777
+
+OSM tiles: served from the predownloaded tree (pandaset_pipe.osmtiles) via
+/api/tile/z/x/y; missing tiles fall back to tile.openstreetmap.org and are
+cached to disk when writable.
 """
 import argparse
+import asyncio
+import concurrent.futures
 import json
 import os
 import struct
@@ -12,18 +18,23 @@ import numpy as np
 from aiohttp import web
 
 from .reader import PandaDataset
+from . import geofit
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "web_static")
+OSM_UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+UA = "pandaset-pipeline-viewer/1.0"
 
 
-def make_app(roots):
+def make_app(roots, osm_dir=None):
     ds = PandaDataset(roots)
     if len(ds) == 0:
         raise SystemExit("no sweeps found in " + ", ".join(roots))
     app = web.Application()
     app["ds"] = ds
-    app["gps_cache"] = {}      # sweep idx -> track arrays
+    app["osm_dir"] = osm_dir
+    app["gps_cache"] = {}      # sweep idx -> track dict
     app["classes_cache"] = {}  # sweep idx -> {class: count}
+    app["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     async def index(request):
         return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
@@ -34,16 +45,7 @@ def make_app(roots):
             "counts": [len(ds[i]) for i in range(len(ds))],
         })
 
-    def gps_track(i):
-        """Full per-frame GPS track + world<->ENU alignment of a sweep; cached.
-
-        aln fits [e;n] = s*R(rot)*[x;y] + t between ego2global translations
-        (pandaset world frame) and ENU meters derived from GPS lat/lon, so the
-        frontend can place OSM tiles in the ego frame (map on the 3D ground
-        plane / in the BEV widget).
-        """
-        if i in app["gps_cache"]:
-            return app["gps_cache"][i]
+    def _gps_track_sync(i):
         sw = ds[i]
         n = len(sw)
         lat = np.zeros(n); lon = np.zeros(n); spd = np.zeros(n)
@@ -57,33 +59,15 @@ def make_app(roots):
             bpath = os.path.join(sw.path, f"boxes_{sw.timestamps[j]}.npz")
             if os.path.exists(bpath):
                 wxy[j] = np.load(bpath)["ego2global_translation"][:2]
-        out = {"lat": lat.tolist(), "lon": lon.tolist(), "speed": (spd * 3.6).tolist(),
-               "ts": sw.timestamps, "aln": None}
-        ok = (lat != 0) | (lon != 0)
-        ok &= ~np.isnan(wxy[:, 0])
-        if ok.sum() >= 3:
-            i0 = int(np.flatnonzero(ok)[0])
-            lat0, lon0 = lat[i0], lon[i0]
-            r_earth = 6378137.0
-            e = np.radians(lon - lon0) * r_earth * np.cos(np.radians(lat0))
-            nn = np.radians(lat - lat0) * r_earth
-            W = wxy[ok] - wxy[ok].mean(0)
-            G = np.stack([e[ok], nn[ok]], 1)
-            G = G - G.mean(0)
-            U, S, Vt = np.linalg.svd(W.T @ G)
-            d = np.sign(np.linalg.det(Vt.T @ U.T))
-            R = Vt.T @ np.diag([1.0, d]) @ U.T
-            s = float((S[0] + d * S[1]) / max((W ** 2).sum(), 1e-9))
-            # t = mu_g - s*R*mu_w  (means of the valid subset)
-            mu_w = wxy[ok].mean(0)
-            mu_g = np.stack([e[ok], nn[ok]], 1).mean(0)
-            t = mu_g - s * R @ mu_w
-            if s > 0.5:
-                out["aln"] = {"s": s, "rot": float(np.arctan2(R[1, 0], R[0, 0])),
-                              "t": [float(t[0]), float(t[1])],
-                              "lat0": float(lat0), "lon0": float(lon0)}
-        app["gps_cache"][i] = out
-        return out
+        aln = geofit.fit_alignment(wxy, lat, lon)
+        return {"lat": lat.tolist(), "lon": lon.tolist(),
+                "speed": (spd * 3.6).tolist(), "ts": sw.timestamps, "aln": aln}
+
+    def gps_track(i):
+        """Full per-frame GPS track + world<->ENU alignment of a sweep; cached."""
+        if i not in app["gps_cache"]:
+            app["gps_cache"][i] = _gps_track_sync(i)
+        return app["gps_cache"][i]
 
     def box_classes(i):
         """Unique box class names + frame counts of a sweep; cached."""
@@ -107,23 +91,27 @@ def make_app(roots):
             "cameras": sw.camera_names,
             "semseg_classes": sw.semseg_classes,
             "has_semseg": len(sw.semseg_classes) > 0,
-            "box_classes": box_classes(i),
-            "timestamps": sw.timestamps,
+            "box_classes": await asyncio.get_event_loop().run_in_executor(
+                app["executor"], box_classes, i),
         })
 
     async def gps_track_api(request):
         i = int(request.query.get("sweep", 0))
-        return web.json_response(gps_track(i))
+        loop = asyncio.get_event_loop()
+        return web.json_response(await loop.run_in_executor(
+            app["executor"], gps_track, i))
 
-    async def frame(request):
-        i = int(request.query.get("sweep", 0))
-        j = int(request.query.get("frame", 0))
-        use_nms = request.query.get("nms", "1") != "0"
+    def _frame_sync(i, j, use_nms):
         sw = ds[i]
         j = max(0, min(j, len(sw) - 1))
         snap = sw[j]
-        pts = snap.points.astype(np.float32, copy=False)
-        inten = snap.intensity
+        # raw lidar npz: keep points as stored (fp16) -> half the payload
+        lz = np.load(os.path.join(sw.path, f"lidar_{sw.timestamps[j]}.npz"))
+        pts = lz["points"]
+        pts_dtype = pts.dtype
+        inten = lz["intensity"]
+        ego_t = lz["ego2global_translation"]
+        ego_q = lz["ego2global_rotation"]
         sem = snap.semseg
         if sem is None:
             sem = np.zeros(len(pts), np.uint8)
@@ -132,7 +120,6 @@ def make_app(roots):
         else:
             boxes, labels = snap.boxes, snap.box_labels
         boxes = boxes.astype(np.float32, copy=False)
-        # per-camera: matched ts (for image url) + projection matrices
         cams = {}
         for cam in sw.camera_names:
             m = snap._match_cam(cam)
@@ -156,15 +143,25 @@ def make_app(roots):
             "labels": [str(x) for x in labels],
             "gps": snap.gps, "cams": cams,
             "frame": j, "frames": len(sw),
+            "pts_dtype": str(pts_dtype),
             # ego pose in world (t + quat wxyz): places OSM tiles in the ego frame
-            "e2g": [float(v) for v in snap.lidar["ego2global_translation"]] +
-                   [float(v) for v in snap.lidar["ego2global_rotation"]],
+            "e2g": [float(v) for v in ego_t] + [float(v) for v in ego_q],
         }
         hj = json.dumps(header).encode()
+        if len(hj) % 2:          # keep the fp16 blob 2-byte aligned
+            hj += b" "
         bufs = [struct.pack("<I", len(hj)), hj,
                 pts.tobytes(), inten.tobytes(), sem.tobytes(), boxes.tobytes()]
-        return web.Response(body=b"".join(bufs),
-                            content_type="application/octet-stream")
+        return b"".join(bufs)
+
+    async def frame(request):
+        i = int(request.query.get("sweep", 0))
+        j = int(request.query.get("frame", 0))
+        use_nms = request.query.get("nms", "1") != "0"
+        loop = asyncio.get_event_loop()
+        body = await loop.run_in_executor(app["executor"], _frame_sync, i, j, use_nms)
+        return web.Response(body=body, content_type="application/octet-stream",
+                            headers={"Cache-Control": "no-store"})
 
     async def camimg(request):
         i = int(request.query.get("sweep", 0))
@@ -176,12 +173,56 @@ def make_app(roots):
             raise web.HTTPNotFound()
         return web.FileResponse(path, headers={"Cache-Control": "max-age=3600"})
 
+    # ---- OSM tiles (predownloaded tree + upstream fallback) -----------------
+    async def osm_plan(request):
+        i = int(request.query.get("sweep", 0))
+        name = ds.sequence_names()[i]
+        p = os.path.join(app["osm_dir"] or "", "plans", f"{name}.json") \
+            if app["osm_dir"] else ""
+        if p and os.path.exists(p):
+            with open(p) as f:
+                return web.json_response(json.load(f))
+        return web.json_response(None)
+
+    async def tile(request):
+        z = int(request.match_info["z"])
+        x = int(request.match_info["x"])
+        y = int(request.match_info["y"])
+        if app["osm_dir"]:
+            path = os.path.join(app["osm_dir"], str(z), str(x), f"{y}.png")
+            if os.path.exists(path):
+                return web.FileResponse(
+                    path, headers={"Cache-Control": "public, max-age=86400"})
+        # fallback: upstream, best-effort cache to disk
+        import aiohttp
+        try:
+            async with aiohttp.ClientSession(headers={"User-Agent": UA}) as sess:
+                async with sess.get(OSM_UPSTREAM.format(z=z, x=x, y=y),
+                                    timeout=aiohttp.ClientTimeout(total=8)) as r:
+                    if r.status != 200:
+                        raise web.HTTPNotFound()
+                    data = await r.read()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            raise web.HTTPNotFound()
+        if app["osm_dir"] and data[:8] == b"\x89PNG\r\n\x1a\n":
+            try:
+                path = os.path.join(app["osm_dir"], str(z), str(x), f"{y}.png")
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                with open(path, "wb") as f:
+                    f.write(data)
+            except OSError:
+                pass
+        return web.Response(body=data, content_type="image/png",
+                            headers={"Cache-Control": "public, max-age=86400"})
+
     app.router.add_get("/", index)
     app.router.add_get("/api/sweeps", sweeps)
     app.router.add_get("/api/meta", meta)
     app.router.add_get("/api/gps_track", gps_track_api)
     app.router.add_get("/api/frame", frame)
     app.router.add_get("/api/camimg", camimg)
+    app.router.add_get("/api/osm_plan", osm_plan)
+    app.router.add_get("/api/tile/{z}/{x}/{y}.png", tile)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     return app
 
@@ -190,9 +231,11 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--roots", nargs="+", required=True)
     ap.add_argument("--port", type=int, default=8777)
+    ap.add_argument("--osm-dir", default=os.environ.get("OSM_TILE_DIR"),
+                    help="predownloaded OSM tile tree (pandaset_pipe.osmtiles)")
     args = ap.parse_args()
-    app = make_app(args.roots)
-    print(f"serving on http://0.0.0.0:{args.port}")
+    app = make_app(args.roots, osm_dir=args.osm_dir)
+    print(f"serving on http://0.0.0.0:{args.port} (osm tiles: {args.osm_dir})")
     web.run_app(app, host="0.0.0.0", port=args.port, print=None)
 
 

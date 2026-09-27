@@ -72,6 +72,27 @@ ssh user@192.168.0.1 'sudo bash -s' < deploy/nfs_server_setup.sh
 sudo bash deploy/client_mount.sh     # /mnt/server/hdd{1,2}
 ```
 
+## OSM-тайлы: предзакачка
+
+```bash
+# на сервере (один раз; ~1200 тайлов на весь датасет, idempotent):
+ssh user@192.168.0.1 'docker run --rm \
+  --mount type=bind,src=/mnt/hdd1/datasets,target=/mnt/hdd1/datasets \
+  --mount type=bind,src=/mnt/hdd2/datasets,target=/mnt/hdd2/datasets \
+  -v /home/user/pandaset_pipeline/src/pandaset_pipe:/app/pandaset_pipe:ro \
+  -w /app -e PYTHONPATH=/app pandaset-pipeline:latest \
+  python -m pandaset_pipe.osmtiles \
+  --roots /mnt/hdd1/datasets/pandaset_npz /mnt/hdd2/datasets/pandaset_npz \
+  --out /mnt/hdd1/datasets/pandaset_osm'
+# -> <out>/<z>/<x>/<y>.png + plans/<seq>.json (план тайлов секвенции)
+```
+
+Проверка локализации карты по всем секвенциям (RMS подгонки GPS↔world +
+«эго на дорожном пикселе» по палитре OSM): `pandaset_pipe.geocheck` —
+**102/103 PASS** (004 — машина стояла, подгонка вырождена, карта не показывается).
+Корневой баг локализации был в переводе метров ENU в градусы (радианы
+складывались с градусами) — карта «отставала» от машины в 57 раз.
+
 ## Просмотр
 
 ### Web-визуализатор (рекомендуется)
@@ -82,6 +103,10 @@ bash docker/viz/run_web.sh                 # контейнер сам монт�
 # открыть http://localhost:8777  (deep-link: /?seq=001&frame=40)
 ```
 
+Тайлы OSM раздаются из предзакачки (`/api/tile`, ~3 мс с диска; нет сети в
+рантайме), карта секвенции — один канвас на всю поездку с запасом (план из
+`plans/<seq>.json`), дальше только перемещается по траектории — без пустых мест.
+
 Возможности: 3D-облако (классическая jet-колорация по высоте / интенсивность /
 дальность turbo / семсег), класс-цветные 3D-боксы с подписями и фильтрами классов
 (кнопка «classes»), BEV-радар с зумом (колесо), паном (drag) и сбросом (dblclick),
@@ -91,7 +116,9 @@ bash docker/viz/run_web.sh                 # контейнер сам монт�
 (fitBounds; клик по треку → переход к кадру), таймлайн профиля скорости,
 скорость воспроизведения 0.5–10x, NMS on/off, range-clip и размер точек.
 Горячие клавиши: `space` `n/b` (кадр) `N/B` (секвенция) `c` (режим цвета) `h` (справка).
-Тайлы карты — OpenStreetMap (грузятся из интернета, позиционируются по GPS из датасета).
+Тайлы карты — OpenStreetMap (предзагружены на сервер, раздаются локально).
+Транспорт кадра: точки fp16 (~1.3 МБ/кадр вместо 2.3), чтение в трэдпуле —
+холодный кадр ~70-90 мс, кэш prefetch на 24 кадра.
 
 Бэкенд: `pandaset_pipe.webserver` (aiohttp) — бинарный протокол кадра
 (~2 МБ/кадр), `/api/frame /api/meta /api/gps_track /api/camimg`.
