@@ -98,27 +98,24 @@ def _sensor_time_offsets(sw, j, cur_idx, cur_offsets):
 
 
 def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
-    """Boxes + ego pose interpolated onto a camera's own timestamp.
+    """Boxes + ego pose interpolated/extrapolated onto a camera's own timestamp.
 
-    Cameras are not synchronized with the lidar: projecting lidar-frame boxes
-    onto a camera image shows a motion offset. Boxes (matched by uuid) are
-    interpolated linearly in the world frame between the surrounding lidar
-    frames; the ego pose is lerped/slerped the same way.
+    Lidar and cameras are not synchronized (offsets 0-100 ms per camera) and a
+    merged lidar frame contains two sensor sweeps with different capture times.
+    For each track (uuid) the detections around ts_cam — each stamped with its
+    own sensor-sweep time — form the trajectory; the adjacent pair nearest to
+    ts_cam is linearly interpolated, or extrapolated (bounded) when the camera
+    timestamp lies past a track's end. The ego pose is lerped/slerped to ts_cam
+    the same way. Calibration is assumed correct (per the dataset).
 
-    Returns (boxes, labels, e2g) where boxes is (M,7) [x y z_world dx dy dz
-    yaw_world] and e2g is [tx ty tz qw qx qy qz] at ts_cam.
+    Returns (boxes, labels, e2g): boxes rows are [x y z_world dx dy dz qw qx
+    qy qz], e2g is [tx ty tz qw qx qy qz] at ts_cam.
     """
     import bisect
     ts = sw.timestamps
     n = len(ts)
     if n == 0:
         return None
-    i = bisect.bisect_left(ts, ts_cam)
-    j1 = min(max(i, 0), n - 1)
-    j0 = min(max(i - 1, 0), n - 1)
-    # per-sensor sweep time offsets for both bracketing frames
-    off0 = _sensor_time_offsets(sw, j0, cur_idx, cur_offsets or {})
-    off1 = _sensor_time_offsets(sw, j1, cur_idx, cur_offsets or {})
 
     def load(j, off):
         p = os.path.join(sw.path, f"boxes_{ts[j]}.npz")
@@ -138,7 +135,7 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
         out = {}
         for k in range(len(b)):
             sid = int(sids[k]) if sids[k] is not None else -1
-            # this box's own capture time: its sensor's sweep offset (dual lidar)
+            # this detection's own capture time: its sensor's sweep offset
             tb = ts[j] + off.get(sid, 0.0) * 1000.0
             cen_w = R_e2w @ b[k, :3] + t
             yaw = b[k, 6]
@@ -149,32 +146,66 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
                                   q_box, str(labels[k]), tb)
         return out, t, q_ego
 
-    L0 = load(j0, off0)
-    L1 = load(j1, off1)
-    if L0 is None and L1 is None:
+    i = bisect.bisect_left(ts, ts_cam)
+    # load a window of frames around ts_cam so tracks can be bracketed or
+    # extrapolated from the nearest pair of detections on their own times
+    frames = sorted({min(max(k, 0), n - 1) for k in (i - 2, i - 1, i, i + 1)})
+    samples = {}   # uuid -> [(t_ms, cen_w, q_box, dx, dy, dz, label), ...]
+    ego = {}       # frame idx -> (t, q)
+    for jf in frames:
+        off = _sensor_time_offsets(sw, jf, cur_idx, cur_offsets or {})
+        L = load(jf, off)
+        if L is None:
+            continue
+        b, t, q = L
+        ego[jf] = (t, q)
+        for uuid, (c0, dx, dy, dz, q_box, lab, tb) in b.items():
+            samples.setdefault(uuid, []).append((tb, c0, q_box, dx, dy, dz, lab))
+
+    # ---- ego pose at ts_cam: bracket or extrapolate from nearest pair ----
+    js = sorted(ego)
+    if not js:
         return None
-    if L0 is None:
-        L0 = L1
-    if L1 is None:
-        L1 = L0
-    b0, t0, q0 = L0
-    b1, t1, q1 = L1
-    dt = float(ts[j1] - ts[j0])
-    # ego pose interpolated onto the camera timestamp
-    a_pose = min(max((ts_cam - ts[j0]) / dt, 0.0), 1.0) if dt else 0.0
-    e2g = np.concatenate([t0 + a_pose * (t1 - t0), _quat_slerp(q0, q1, a_pose)])
+    j_lo = max((k for k in js if ts[k] <= ts_cam), default=min(js))
+    j_hi = min((k for k in js if ts[k] > ts_cam), default=max(js))
+    if j_lo == j_hi:
+        j_hi = j_lo + 1 if j_lo + 1 in ego else j_lo - 1
+    t0, q0 = ego[j_lo]
+    t1, q1 = ego[j_hi]
+    dt_e = float(ts[j_hi] - ts[j_lo]) or 1.0
+    a_e = (ts_cam - ts[j_lo]) / dt_e
+    a_e = min(max(a_e, -0.6), 1.6)                  # bounded ego extrapolation
+    e2g = np.concatenate([t0 + a_e * (t1 - t0), _quat_slerp(q0, q1, a_e)])
+
+    # ---- per-track interpolation / extrapolation onto ts_cam ----
     boxes, labels = [], []
-    for uuid, (c0, dx, dy, dz, q_box0, lab, tb0) in b0.items():
-        # per-box interpolation fraction on the box's own sensor timeline
-        a = min(max((ts_cam - tb0) / dt, 0.0), 1.0) if dt else 0.0
-        if uuid in b1:
-            c1, _, _, _, q_box1, _, _ = b1[uuid]
-            cen = c0 + a * (c1 - c0)
-            q_box = _quat_slerp(q_box0, q_box1, a)
+    for uuid, ss in samples.items():
+        ss.sort(key=lambda s: s[0])
+        if len(ss) == 1:
+            if abs(ss[0][0] - ts_cam) > 150:        # single stale detection
+                continue
+            tb, c0, q_box, dx, dy, dz, lab = ss[0]
+            cen, qb = c0, q_box
         else:
-            cen, q_box = c0, q_box0
-        boxes.append([cen[0], cen[1], cen[2], dx, dy, dz] + list(q_box))
+            # adjacent pair nearest in time to ts_cam
+            best, bd = None, None
+            for a_, b_ in zip(ss[:-1], ss[1:]):
+                d = max(abs(a_[0] - ts_cam), abs(b_[0] - ts_cam))
+                if bd is None or d < bd:
+                    bd, best = d, (a_, b_)
+            (ta, ca, qa, dx, dy, dz, lab), (tb, cb, qb2, *_rest) = best[0], best[1]
+            if abs(ta - ts_cam) > 250 and abs(tb - ts_cam) > 250:
+                continue                            # track too far from camera ts
+            dt = float(tb - ta) or 1.0
+            a = (ts_cam - ta) / dt
+            if not (-0.35 <= a <= 1.35):            # bounded extrapolation
+                a = min(max(a, -0.35), 1.35)
+            cen = ca + a * (cb - ca)
+            qb = _quat_slerp(qa, qb2, a)
+        boxes.append([cen[0], cen[1], cen[2], dx, dy, dz] + list(qb))
         labels.append(lab)
+    if not boxes:
+        return None
     return np.array(boxes, dtype=np.float64), labels, e2g.tolist()
 
 
