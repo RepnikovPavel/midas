@@ -35,18 +35,53 @@ def make_app(roots):
         })
 
     def gps_track(i):
-        """Full per-frame GPS track of a sweep (lat, lon, speed kmh); cached."""
+        """Full per-frame GPS track + world<->ENU alignment of a sweep; cached.
+
+        aln fits [e;n] = s*R(rot)*[x;y] + t between ego2global translations
+        (pandaset world frame) and ENU meters derived from GPS lat/lon, so the
+        frontend can place OSM tiles in the ego frame (map on the 3D ground
+        plane / in the BEV widget).
+        """
         if i in app["gps_cache"]:
             return app["gps_cache"][i]
         sw = ds[i]
-        lat = np.zeros(len(sw)); lon = np.zeros(len(sw)); spd = np.zeros(len(sw))
-        for j in range(len(sw)):
-            g = sw[j].gps
+        n = len(sw)
+        lat = np.zeros(n); lon = np.zeros(n); spd = np.zeros(n)
+        wxy = np.full((n, 2), np.nan)
+        for j in range(n):
+            snap = sw[j]
+            g = snap.gps
             lat[j] = g.get("lat", 0.0)
             lon[j] = g.get("long", 0.0)
             spd[j] = g.get("speed", 0.0)
+            bpath = os.path.join(sw.path, f"boxes_{sw.timestamps[j]}.npz")
+            if os.path.exists(bpath):
+                wxy[j] = np.load(bpath)["ego2global_translation"][:2]
         out = {"lat": lat.tolist(), "lon": lon.tolist(), "speed": (spd * 3.6).tolist(),
-               "ts": sw.timestamps}
+               "ts": sw.timestamps, "aln": None}
+        ok = (lat != 0) | (lon != 0)
+        ok &= ~np.isnan(wxy[:, 0])
+        if ok.sum() >= 3:
+            i0 = int(np.flatnonzero(ok)[0])
+            lat0, lon0 = lat[i0], lon[i0]
+            r_earth = 6378137.0
+            e = np.radians(lon - lon0) * r_earth * np.cos(np.radians(lat0))
+            nn = np.radians(lat - lat0) * r_earth
+            W = wxy[ok] - wxy[ok].mean(0)
+            G = np.stack([e[ok], nn[ok]], 1)
+            G = G - G.mean(0)
+            U, S, Vt = np.linalg.svd(W.T @ G)
+            d = np.sign(np.linalg.det(Vt.T @ U.T))
+            R = Vt.T @ np.diag([1.0, d]) @ U.T
+            s = float((S[0] + d * S[1]) / max((W ** 2).sum(), 1e-9))
+            # t = mu_g - s*R*mu_w  (means of the valid subset)
+            mu_w = wxy[ok].mean(0)
+            mu_g = np.stack([e[ok], nn[ok]], 1).mean(0)
+            t = mu_g - s * R @ mu_w
+            if s > 0.5:
+                out["aln"] = {"s": s, "rot": float(np.arctan2(R[1, 0], R[0, 0])),
+                              "t": [float(t[0]), float(t[1])],
+                              "lat0": float(lat0), "lon0": float(lon0)}
         app["gps_cache"][i] = out
         return out
 
@@ -121,6 +156,9 @@ def make_app(roots):
             "labels": [str(x) for x in labels],
             "gps": snap.gps, "cams": cams,
             "frame": j, "frames": len(sw),
+            # ego pose in world (t + quat wxyz): places OSM tiles in the ego frame
+            "e2g": [float(v) for v in snap.lidar["ego2global_translation"]] +
+                   [float(v) for v in snap.lidar["ego2global_rotation"]],
         }
         hj = json.dumps(header).encode()
         bufs = [struct.pack("<I", len(hj)), hj,

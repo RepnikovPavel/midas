@@ -1,21 +1,31 @@
 /* PandaSet WebGL viewer frontend. Data: /api/* (aiohttp backend).
-   Ego frame: X forward, Y left, Z up. */
+   Ego frame: X forward, Y left, Z up. Map tiles (c) OpenStreetMap. */
 "use strict";
 
 const CAM_ORDER = ["front_left_camera", "front_camera", "front_right_camera",
                    "left_camera", "back_camera", "right_camera"];
 
 // ------------------------------------------------------------ colormaps
-const TURBO = new Uint8Array(256 * 3);
-{ // polynomial approximation of Google's turbo colormap
-  const cl = v => v < 0 ? 0 : (v > 255 ? 255 : v);
+const clamp255 = v => v < 0 ? 0 : (v > 255 ? 255 : v);
+const TURBO = new Uint8Array(256 * 3);   // range mode
+const JET = new Uint8Array(256 * 3);     // classic height mode
+{ // polynomial approximation of Google's turbo
   for (let i = 0; i < 256; i++) {
     const t = i / 255;
-    TURBO[i * 3]     = cl(34.61 + t * (1172.33 + t * (-10793.56 + t * (33300.12 + t * (-38394.49 + t * 14825.05)))));
-    TURBO[i * 3 + 1] = cl(23.06 + t * (557.33 + t * (1225.33 + t * (-3574.96 + t * (3220.32 - t * 1320.25)))));
-    TURBO[i * 3 + 2] = cl(27.2 + t * (3211.1 + t * (-15327.97 + t * (27814 + t * (-22569.18 + t * 6838.66)))));
+    TURBO[i * 3]     = clamp255(34.61 + t * (1172.33 + t * (-10793.56 + t * (33300.12 + t * (-38394.49 + t * 14825.05)))));
+    TURBO[i * 3 + 1] = clamp255(23.06 + t * (557.33 + t * (1225.33 + t * (-3574.96 + t * (3220.32 - t * 1320.25)))));
+    TURBO[i * 3 + 2] = clamp255(27.2 + t * (3211.1 + t * (-15327.97 + t * (27814 + t * (-22569.18 + t * 6838.66)))));
   }
 }
+{ // classic jet: dark blue -> cyan -> green -> yellow -> red
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255;
+    JET[i * 3]     = clamp255(255 * (1.5 - Math.abs(4 * t - 3)));
+    JET[i * 3 + 1] = clamp255(255 * (1.5 - Math.abs(4 * t - 2)));
+    JET[i * 3 + 2] = clamp255(255 * (1.5 - Math.abs(4 * t - 1)));
+  }
+}
+const Z_MIN = -2.5, Z_MAX = 7.5;         // height colormap range (m)
 const SEMSEG_PALETTE = [];
 { const base = { 0: [128, 128, 128], 1: [150, 60, 60], 5: [90, 90, 220], 6: [60, 60, 200],
   7: [80, 80, 180], 11: [220, 220, 60], 13: [160, 100, 40], 15: [200, 160, 60],
@@ -29,7 +39,7 @@ function classColor(name) {  // deterministic color per class name
   let h = 0;
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0;
   const hue = (h * 137.508) % 360;
-  const a = 0.85, b = 0.55;  // HSV(hue, .85, .95) approx via HSL
+  const a = 0.85, b = 0.55;
   const c = (1 - Math.abs(2 * b - 1)) * a;
   const x = c * (1 - Math.abs(((hue / 60) % 2) - 1));
   const m = b - c / 2;
@@ -44,13 +54,13 @@ const state = {
   sweeps: [], counts: [], sweep: 0, frame: 0, frames: 1,
   playing: true, dataFps: 5, colorMode: "height",
   showLidar: true, showBoxes: true, showCamLbl: true, showNms: true,
-  showFrustum: true, showGrid: true, showLabels3d: true, showBev: true,
-  followMap: true, ptSize: 0.06, rangeClip: Infinity,
+  showMap3d: true, showMapBev: true, showGrid: true, showLabels3d: true,
+  showBev: true, followMap: false, ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
   hiddenClasses: new Set(), classColors: {},
-  track: null,               // gps track of current sweep
+  track: null,               // gps track + world<->ENU alignment of current sweep
   gpsTrackDrawn: [],
-  cache: new Map(),          // key -> Promise<data>
+  cache: new Map(),
   lastLoadMs: 0, netKB: 0,
 };
 const $ = id => document.getElementById(id);
@@ -96,7 +106,6 @@ function prefetch() {
   for (let f = a; f <= b; f++) loadFrame(state.sweep, f).catch(() => {});
 }
 
-// point colors for a frame, cached per mode+clip in the data object
 function pointColors(data, mode, clip2) {
   const ck = mode + ":" + clip2;
   if (data.colors[ck]) return data.colors[ck];
@@ -111,9 +120,9 @@ function pointColors(data, mode, clip2) {
       const d = Math.min(1.999, Math.hypot(pts[i * 3], pts[i * 3 + 1]) / 40);
       const k = (d | 0) * 3; r = TURBO[k]; g = TURBO[k + 1]; b = TURBO[k + 2];
     } else {
-      const z = pts[i * 3 + 2];
-      let t = (z + 3.0) / 6.0; t = t < 0 ? 0 : (t > 0.999 ? 0.999 : t);
-      const k = (t * 255 | 0) * 3; r = TURBO[k]; g = TURBO[k + 1]; b = TURBO[k + 2];
+      let t = (pts[i * 3 + 2] - Z_MIN) / (Z_MAX - Z_MIN);
+      t = t < 0 ? 0 : (t > 0.999 ? 0.999 : t);
+      const k = (t * 255 | 0) * 3; r = JET[k]; g = JET[k + 1]; b = JET[k + 2];
     }
     out[i * 3] = r / 255; out[i * 3 + 1] = g / 255; out[i * 3 + 2] = b / 255;
   }
@@ -121,7 +130,6 @@ function pointColors(data, mode, clip2) {
   return out;
 }
 
-// in-range mask (range clip from ego origin)
 function rangeMask(data) {
   const ck = "mask:" + state.rangeClip;
   if (data.colors[ck]) return data.colors[ck];
@@ -148,6 +156,114 @@ function clippedPoints(data, colors) {
 
 function boxVisible(label) { return !state.hiddenClasses.has(label); }
 
+function quatToMat(q) {
+  const w = q[0], x = q[1], y = q[2], z = q[3];
+  const n = w*w + x*x + y*y + z*z, s = n > 0 ? 2 / n : 0;
+  const wx = s*w*x, wy = s*w*y, wz = s*w*z, xx = s*x*x, xy = s*x*y, xz = s*x*z,
+        yy = s*y*y, yz = s*y*z, zz = s*z*z;
+  return [[1-(yy+zz), xy-wz, xz+wy], [xy+wz, 1-(xx+zz), yz-wx], [xz-wy, yz+wx, 1-(xx+yy)]];
+}
+
+// ------------------------------------------------------------ OSM tiles
+// Tiles (c) OpenStreetMap contributors; positioned via GPS<->world alignment.
+const R_EARTH = 6378137, CIRC = 2 * Math.PI * R_EARTH;
+const TILE_Z = 18;
+const tiles = { img: new Map(), stitch: new Map() };
+
+function tileImg(z, x, y) {
+  const k = z + "/" + x + "/" + y;
+  let t = tiles.img.get(k);
+  if (!t) {
+    t = { img: new Image(), ok: false };
+    t.img.crossOrigin = "anonymous";
+    t.img.onload = () => { t.ok = true; requestRender(); };
+    t.img.src = `https://tile.openstreetmap.org/${z}/${x}/${y}.png`;
+    tiles.img.set(k, t);
+    if (tiles.img.size > 120) {  // simple LRU trim
+      const first = tiles.img.keys().next().value;
+      tiles.img.delete(first);
+    }
+  }
+  return t;
+}
+
+// stitched N x N tile canvas with (x0,y0) as the top-left tile
+function stitched(z, x0, y0, N) {
+  const key = z + "/" + x0 + "/" + y0 + "/" + N;
+  let s = tiles.stitch.get(key);
+  if (!s) {
+    const c = document.createElement("canvas");
+    c.width = N * 256; c.height = N * 256;
+    s = { canvas: c, x0, y0, z, n: N, painted: new Set(), lastPainted: 0 };
+    tiles.stitch.set(key, s);
+    if (tiles.stitch.size > 8) tiles.stitch.delete(tiles.stitch.keys().next().value);
+  }
+  for (let i = 0; i < N; i++) for (let j = 0; j < N; j++) {
+    const kk = i + "," + j;
+    if (s.painted.has(kk)) continue;
+    const t = tileImg(z, x0 + i, y0 + j);
+    if (t.ok) {
+      s.canvas.getContext("2d").drawImage(t.img, i * 256, j * 256);
+      s.painted.add(kk);
+    }
+  }
+  s.dirty = s.painted.size !== s.lastPainted;
+  s.lastPainted = s.painted.size;
+  s.ready = s.painted.size === N * N;
+  return s;
+}
+
+function lon2px(lon, z) { return ((lon / 360 + 0.5) * 256 * 2 ** z); }
+function lat2py(lat, z) {
+  const s = Math.sin(lat * Math.PI / 180);
+  return (0.5 - Math.log((1 + s) / (1 - s)) / (4 * Math.PI)) * 256 * 2 ** z;
+}
+function gpx2mx(px, z) { return ((px / (256 * 2 ** z)) - 0.5) * CIRC; }
+function gpx2my(py, z) { return (0.5 - (py / (256 * 2 ** z))) * CIRC; }
+
+// per-frame ENU -> ego mapping (uses gps/world alignment + ego pose)
+function frameGeo(header) {
+  const aln = state.track && state.track.aln;
+  if (!aln || !header.e2g) return null;
+  const R = quatToMat(header.e2g.slice(3, 7));   // world_from_ego rotation
+  const tw = header.e2g.slice(0, 3);             // ego position in world
+  const cA = Math.cos(aln.rot), sA = Math.sin(aln.rot);
+  const ca = Math.cos(aln.lat0 * Math.PI / 180);
+  const mx0 = gpx2mx(lon2px(aln.lon0, TILE_Z), TILE_Z);
+  const my0 = gpx2my(lat2py(aln.lat0, TILE_Z), TILE_Z);
+  const zw = tw[2] - 1.7;                        // world z of the ground plane
+  function map(e, n) {
+    const de = e - aln.t[0], dn = n - aln.t[1];
+    const x = ( cA * de + sA * dn) / aln.s;
+    const y = (-sA * de + cA * dn) / aln.s;
+    const dx = x - tw[0], dy = y - tw[1], dz = zw - tw[2];
+    return [R[0][0]*dx + R[1][0]*dy + R[2][0]*dz,
+            R[0][1]*dx + R[1][1]*dy + R[2][1]*dz,
+            R[0][2]*dx + R[1][2]*dy + R[2][2]*dz];
+  }
+  // ego ENU position (for locating tiles)
+  const eE = aln.s * (cA * tw[0] - sA * tw[1]) + aln.t[0];
+  const nE = aln.s * (sA * tw[0] + cA * tw[1]) + aln.t[1];
+  return { aln, ca, mx0, my0, map, eE, nE };
+}
+
+// stitched tiles around the ego position, geo helpers attached
+function mapPatch(header, N) {
+  const g = frameGeo(header);
+  if (!g) return null;
+  const lon = g.aln.lon0 + g.eE / (R_EARTH * g.ca);
+  const lat = g.aln.lat0 + g.nE / R_EARTH;
+  const px = lon2px(lon, TILE_Z), py = lat2py(lat, TILE_Z);
+  const cx = Math.floor(px / 256), cy = Math.floor(py / 256);
+  const s = stitched(TILE_Z, cx - (N >> 1), cy - (N >> 1), N);
+  // stitched canvas top-left in ENU meters
+  const x0 = s.x0 * 256, y0 = s.y0 * 256;
+  const eTL = (gpx2mx(x0, TILE_Z) - g.mx0) * g.ca;
+  const nTL = (gpx2my(y0, TILE_Z) - g.my0) * g.ca;
+  const mPerPx = CIRC * g.ca / (256 * 2 ** TILE_Z);
+  return { g, s, eTL, nTL, mPerPx };
+}
+
 // ------------------------------------------------------------ 3D scene
 const canvas3d = $("view3d");
 const renderer = new THREE.WebGLRenderer({ canvas: canvas3d, antialias: true });
@@ -163,6 +279,15 @@ scene3.add(new THREE.AxesHelper(3));
 const grid3 = new THREE.GridHelper(160, 16, 0x2a3b2f, 0x1a2420);
 grid3.rotation.x = Math.PI / 2;
 scene3.add(grid3);
+
+// OSM map on the ground plane
+const mapPlane = new THREE.Mesh(
+  new THREE.PlaneGeometry(1, 1),
+  new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false,
+                                side: THREE.DoubleSide }));
+mapPlane.visible = false;
+scene3.add(mapPlane);
+let mapTexKey = null, mapTex = null;
 
 // ego vehicle wireframe (X fwd)
 {
@@ -189,12 +314,6 @@ boxGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3
 boxGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
 const boxes3 = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({ vertexColors: true }));
 scene3.add(boxes3);
-
-const frustumGeo = new THREE.BufferGeometry();
-frustumGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
-const frustums3 = new THREE.LineSegments(frustumGeo,
-  new THREE.LineBasicMaterial({ color: 0x33ccff, transparent: true, opacity: 0.55 }));
-scene3.add(frustums3);
 
 // box labels as sprites
 const labelTexCache = new Map();
@@ -240,12 +359,28 @@ function boxCorners(b) {
 }
 
 function visibleBoxes(data) {
-  // indices of boxes with visible class
   const out = [];
   const labels = data.header.labels, nb = data.header.nb;
   for (let k = 0; k < nb; k++)
     if (state.showBoxes && boxVisible(labels[k])) out.push(k);
   return out;
+}
+
+// local ground height in ego frame (median of near-field points), cached per frame
+function groundLevel(data) {
+  if (data.colors.gz !== undefined) return data.colors.gz;
+  const pts = data.points, m = rangeMask(data), n = data.header.n;
+  const zs = [];
+  for (let i = 0; i < n; i++) {
+    if (!m[i]) continue;
+    const x = pts[i * 3], y = pts[i * 3 + 1];
+    if (x * x + y * y < 100) zs.push(pts[i * 3 + 2]);   // within 10 m
+  }
+  let g;
+  if (zs.length > 50) { zs.sort((a, b) => a - b); g = zs[zs.length >> 1] - 0.25; }
+  else g = -1.9;
+  data.colors.gz = g;
+  return g;
 }
 
 function render3d(data) {
@@ -270,7 +405,6 @@ function render3d(data) {
       pos.set(cor.subarray(a * 3, a * 3 + 3), o); col.set(c, o); o += 3;
       pos.set(cor.subarray(bb * 3, bb * 3 + 3), o); col.set(c, o); o += 3;
     }
-    // heading arrow along box direction
     const hl = b[3] / 2, ca = Math.cos(b[6]), sa = Math.sin(b[6]);
     pos[o] = b[0]; pos[o + 1] = b[1]; pos[o + 2] = b[2]; col.set(c, o); o += 3;
     pos[o] = b[0] + hl * ca; pos[o + 1] = b[1] + hl * sa; pos[o + 2] = b[2]; col.set(c, o); o += 3;
@@ -279,7 +413,6 @@ function render3d(data) {
   boxGeo.setAttribute("color", new THREE.BufferAttribute(col, 3));
   boxes3.visible = true;
 
-  // labels
   let li = 0;
   if (state.showLabels3d) {
     for (; li < Math.min(idx.length, labelSprites.length); li++) {
@@ -295,79 +428,123 @@ function render3d(data) {
   }
   for (; li < labelSprites.length; li++) labelSprites[li].visible = false;
 
-  // camera frustums
-  const fp = [];
-  if (state.showFrustum) {
-    for (const cam of CAM_ORDER) {
-      const cd = data.header.cams[cam];
-      if (!cd) continue;
-      const R = quatToMat(cd.R), t = cd.t, K = cd.K;
-      const fwd = [R[0][2], R[1][2], R[2][2]];
-      const rgt = [R[0][0], R[1][0], R[2][0]];
-      const up  = [R[0][1], R[1][1], R[2][1]];
-      const L = 3.4, ax = (cd.w / 2) / K[0][0] * L, ay = (cd.h / 2) / K[1][1] * L;
-      const cor = [];
-      for (const [sa, sb] of [[-1,-1],[1,-1],[1,1],[-1,1]])
-        cor.push([t[0] + fwd[0]*L + rgt[0]*ax*sa + up[0]*ay*sb,
-                  t[1] + fwd[1]*L + rgt[1]*ax*sa + up[1]*ay*sb,
-                  t[2] + fwd[2]*L + rgt[2]*ax*sa + up[2]*ay*sb]);
-      for (const c of cor) fp.push(t[0], t[1], t[2], c[0], c[1], c[2]);
-      for (let i = 0; i < 4; i++) {
-        const a = cor[i], b = cor[(i + 1) % 4];
-        fp.push(a[0], a[1], a[2], b[0], b[1], b[2]);
-      }
-    }
-  }
-  frustumGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(fp), 3));
   grid3.visible = state.showGrid;
+
+  // ---- OSM map on the ground plane ----
+  if (state.showMap3d) {
+    const mp = mapPatch(data.header, 2);
+    if (mp) {
+      const Wpx = mp.s.canvas.width, Hpx = mp.s.canvas.height;
+      // flatten in the EGO frame (same projection the BEV uses): the pandaset
+      // world frame is not gravity-aligned, so a world-horizontal plane would
+      // appear tilted ~2-4 deg; take (x, y) only and pin z to the local ground
+      const gz = groundLevel(data);
+      const c00 = mp.g.map(mp.eTL, mp.nTL); c00[2] = gz;
+      const c10 = mp.g.map(mp.eTL + Wpx * mp.mPerPx, mp.nTL); c10[2] = gz;
+      const c01 = mp.g.map(mp.eTL, mp.nTL - Hpx * mp.mPerPx); c01[2] = gz;
+      const key = TILE_Z + "/" + mp.s.x0 + "/" + mp.s.y0;
+      if (mapTexKey !== key || mp.s.dirty) {
+        if (mapTex) mapTex.dispose();
+        mapTex = new THREE.CanvasTexture(mp.s.canvas);
+        mapTex.flipY = false;
+        mapTexKey = key;
+      }
+      mapPlane.material.map = mapTex;
+      mapPlane.material.needsUpdate = true;
+      const u = [c10[0] - c00[0], c10[1] - c00[1], c10[2] - c00[2]];
+      const v = [c01[0] - c00[0], c01[1] - c00[1], c01[2] - c00[2]];
+      const lu = Math.hypot(...u) || 1, lv = Math.hypot(...v) || 1;
+      const ux = new THREE.Vector3(u[0] / lu, u[1] / lu, u[2] / lu);
+      const vy = new THREE.Vector3(v[0] / lv, v[1] / lv, v[2] / lv);
+      const nz = new THREE.Vector3().crossVectors(ux, vy);
+      const m = new THREE.Matrix4().makeBasis(ux, vy, nz);
+      mapPlane.quaternion.setFromRotationMatrix(m);
+      mapPlane.scale.set(lu, lv, 1);
+      mapPlane.position.set(c00[0] + u[0] / 2 + v[0] / 2, c00[1] + u[1] / 2 + v[1] / 2,
+                            c00[2] + u[2] / 2 + v[2] / 2);
+      mapPlane.visible = true;
+    } else mapPlane.visible = false;
+  } else mapPlane.visible = false;
+
   return cp.n;
 }
 
 // ------------------------------------------------------------ BEV radar
 const bev = $("bev"), bevCtx = bev.getContext("2d");
-const BEV_RANGE = 60;   // meters radius
+// offscreen canvas for points: putImageData would wipe the map underlay,
+// so points are composed with drawImage (alpha) instead
+const bevPtsCv = document.createElement("canvas");
+bevPtsCv.width = bev.width; bevPtsCv.height = bev.height;
+const bevPtsCtx = bevPtsCv.getContext("2d");
+const bevView = { z: 1, x: 0, y: 0 };   // zoom factor + pan px
+const BEV_BASE_R = 60;                   // meters radius at zoom 1
+
 function renderBev(data) {
-  const W = bev.width, cx = W / 2, cy = W / 2, s = (W / 2 - 12) / BEV_RANGE;
+  const W = bev.width, cx = W / 2, cy = W / 2;
+  const scale = (W / 2 - 12) * bevView.z / BEV_BASE_R;
+  const px = (ex, ey) => [cx + bevView.x - ey * scale, cy + bevView.y - ex * scale];
   bevCtx.fillStyle = "#080b0e";
   bevCtx.fillRect(0, 0, W, W);
-  // range rings
-  bevCtx.strokeStyle = "rgba(90,110,125,0.35)";
+
+  // ---- OSM underlay ----
+  if (state.showMapBev) {
+    const mp = mapPatch(data.header, 3);
+    if (mp) {
+      const [sx0, sy0] = px(...mp.g.map(mp.eTL, mp.nTL).slice(0, 2));
+      const [sx1, sy1] = px(...mp.g.map(mp.eTL + mp.s.canvas.width * mp.mPerPx, mp.nTL).slice(0, 2));
+      const [sx2, sy2] = px(...mp.g.map(mp.eTL, mp.nTL - mp.s.canvas.height * mp.mPerPx).slice(0, 2));
+      const w = mp.s.canvas.width, h = mp.s.canvas.height;
+      const a = (sx1 - sx0) / w, b = (sy1 - sy0) / w;
+      const c = (sx2 - sx0) / h, d = (sy2 - sy0) / h;
+      if ((a * a + b * b) > 1e-12) {
+        bevCtx.save();
+        bevCtx.setTransform(a, b, c, d, sx0, sy0);
+        bevCtx.globalAlpha = 0.85;
+        bevCtx.drawImage(mp.s.canvas, 0, 0);
+        bevCtx.restore();
+        bevCtx.setTransform(1, 0, 0, 1, 0, 0);
+      }
+    }
+  }
+
+  // ---- range rings ----
+  const visR = (W / 2 + Math.max(Math.abs(bevView.x), Math.abs(bevView.y))) / scale;
+  let step = 5;
+  for (const s of [1, 2, 5, 10, 20, 50, 100, 200])
+    { step = s; if (s * scale >= 60) break; }
+  bevCtx.strokeStyle = "rgba(90,110,125,0.4)";
   bevCtx.lineWidth = 1;
   bevCtx.font = "16px ui-monospace, monospace";
-  bevCtx.fillStyle = "rgba(140,160,175,0.55)";
-  for (let r = 20; r <= BEV_RANGE; r += 20) {
-    bevCtx.beginPath(); bevCtx.arc(cx, cy, r * s, 0, 2 * Math.PI); bevCtx.stroke();
-    bevCtx.fillText(r + "m", cx + 3, cy - r * s - 3);
+  bevCtx.fillStyle = "rgba(160,180,195,0.7)";
+  for (let r = step; r <= visR + step; r += step) {
+    bevCtx.beginPath(); bevCtx.arc(cx + bevView.x, cy + bevView.y, r * scale, 0, 2 * Math.PI);
+    bevCtx.stroke();
+    const [lx, ly] = px(0, 0);
+    bevCtx.fillText(r + "m", lx + 4, cy + bevView.y - r * scale - 4);
   }
-  // cross axes
-  bevCtx.strokeStyle = "rgba(90,110,125,0.25)";
-  bevCtx.beginPath();
-  bevCtx.moveTo(cx, 12); bevCtx.lineTo(cx, W - 12);
-  bevCtx.moveTo(12, cy); bevCtx.lineTo(W - 12, cy);
-  bevCtx.stroke();
 
-  // points via ImageData
+  // ---- points (offscreen ImageData, composed over the map) ----
   const colors = pointColors(data, state.colorMode, state.rangeClip);
   const m = rangeMask(data), pts = data.points, n = data.header.n;
-  const img = bevCtx.createImageData(W, W);
+  const img = bevPtsCtx.createImageData(W, W);
   const d = img.data;
-  let cnt = 0;
   for (let i = 0; i < n; i++) {
     if (!m[i]) continue;
-    const px = (cx - pts[i * 3 + 1] * s) | 0, py = (cy - pts[i * 3] * s) | 0;
-    if (px < 0 || px >= W - 1 || py < 0 || py >= W - 1) continue;
+    const pxx = (cx + bevView.x - pts[i * 3 + 1] * scale) | 0;
+    const pyy = (cy + bevView.y - pts[i * 3 + 0] * scale) | 0;
+    if (pxx < 0 || pxx >= W - 1 || pyy < 0 || pyy >= W - 1) continue;
     const r = Math.min(255, (colors[i * 3] * 255 * 1.45) | 0),
           g = Math.min(255, (colors[i * 3 + 1] * 255 * 1.45) | 0),
           b = Math.min(255, (colors[i * 3 + 2] * 255 * 1.45) | 0);
     for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
-      const q = ((py + oy) * W + px + ox) * 4;
+      const q = ((pyy + oy) * W + pxx + ox) * 4;
       d[q] = r; d[q + 1] = g; d[q + 2] = b; d[q + 3] = 255;
     }
-    cnt++;
   }
-  bevCtx.putImageData(img, 0, 0);
+  bevPtsCtx.putImageData(img, 0, 0);
+  bevCtx.drawImage(bevPtsCv, 0, 0);
 
-  // boxes
+  // ---- boxes ----
   const idx = visibleBoxes(data), labels = data.header.labels, cols = classColorsFor(labels);
   bevCtx.lineWidth = 2.5;
   for (const k of idx) {
@@ -376,41 +553,68 @@ function renderBev(data) {
     bevCtx.strokeStyle = cols[k].css;
     bevCtx.beginPath();
     for (let i = 0; i < 4; i++) {
-      const a = cor.subarray(i * 3, i * 3 + 3), bb = cor.subarray(((i + 1) % 4) * 3, ((i + 1) % 4) * 3 + 3);
-      const x1 = cx - a[1] * s, y1 = cy - a[0] * s, x2 = cx - bb[1] * s, y2 = cy - bb[0] * s;
+      const a = cor.subarray(i * 3, i * 3 + 3);
+      const bb = cor.subarray(((i + 1) % 4) * 3, ((i + 1) % 4) * 3 + 3);
+      const [x1, y1] = px(a[0], a[1]), [x2, y2] = px(bb[0], bb[1]);
       if (i === 0) bevCtx.moveTo(x1, y1); else bevCtx.lineTo(x1, y1);
       bevCtx.lineTo(x2, y2);
     }
     bevCtx.stroke();
-    // heading tick
     const hl = b[3] / 2, ca = Math.cos(b[6]), sa = Math.sin(b[6]);
     bevCtx.beginPath();
-    bevCtx.moveTo(cx - b[1] * s, cy - b[0] * s);
-    bevCtx.lineTo(cx - (b[1] + hl * sa) * s, cy - (b[0] + hl * ca) * s);
+    const [ax, ay] = px(b[0], b[1]);
+    const [bx2, by2] = px(b[0] + hl * ca, b[1] + hl * sa);
+    bevCtx.moveTo(ax, ay);
+    bevCtx.lineTo(bx2, by2);
     bevCtx.stroke();
   }
 
-  // ego triangle (points up = forward)
+  // ---- ego triangle (points up = forward) ----
   bevCtx.fillStyle = "#66aaff";
+  const [ex0, ey0] = px(0, 0);
   bevCtx.beginPath();
-  bevCtx.moveTo(cx, cy - 10);
-  bevCtx.lineTo(cx - 7, cy + 8);
-  bevCtx.lineTo(cx + 7, cy + 8);
+  bevCtx.moveTo(ex0, ey0 - 10);
+  bevCtx.lineTo(ex0 - 7, ey0 + 8);
+  bevCtx.lineTo(ex0 + 7, ey0 + 8);
   bevCtx.closePath();
   bevCtx.fill();
-  return cnt;
+  $("bevRange").textContent = Math.round(BEV_BASE_R / bevView.z) + " m";
+}
+
+// BEV navigation: wheel zoom to cursor, drag pan, double-click reset
+{
+  const wrap = $("bev-wrap");
+  wrap.addEventListener("wheel", e => {
+    e.preventDefault();
+    const r = bev.getBoundingClientRect();
+    const mx = (e.clientX - r.left) / r.width * bev.width - bev.width / 2;
+    const my = (e.clientY - r.top) / r.height * bev.height - bev.height / 2;
+    const z2 = Math.min(20, Math.max(0.2, bevView.z * (e.deltaY < 0 ? 1.25 : 0.8)));
+    const k = z2 / bevView.z;
+    bevView.x = mx + (bevView.x - mx) * k;
+    bevView.y = my + (bevView.y - my) * k;
+    bevView.z = z2;
+    render();
+  }, { passive: false });
+  let drag = null;
+  wrap.addEventListener("pointerdown", e => {
+    drag = { x: e.clientX, y: e.clientY, bx: bevView.x, by: bevView.y };
+    wrap.setPointerCapture(e.pointerId);
+  });
+  wrap.addEventListener("pointermove", e => {
+    if (!drag) return;
+    const r = bev.getBoundingClientRect();
+    const k = bev.width / r.width;
+    bevView.x = drag.bx + (e.clientX - drag.x) * k;
+    bevView.y = drag.by + (e.clientY - drag.y) * k;
+    render();
+  });
+  wrap.addEventListener("pointerup", () => { drag = null; });
+  wrap.addEventListener("dblclick", () => { bevView.z = 1; bevView.x = 0; bevView.y = 0; render(); });
 }
 
 // ------------------------------------------------------------ cameras
-const camPanels = {};   // cam -> panel object
-
-function quatToMat(q) {
-  const w = q[0], x = q[1], y = q[2], z = q[3];
-  const n = w*w + x*x + y*y + z*z, s = n > 0 ? 2 / n : 0;
-  const wx = s*w*x, wy = s*w*y, wz = s*w*z, xx = s*x*x, xy = s*x*y, xz = s*x*z,
-        yy = s*y*y, yz = s*y*z, zz = s*z*z;
-  return [[1-(yy+zz), xy-wz, xz+wy], [xy+wz, 1-(xx+zz), yz-wx], [xz-wy, yz+wx, 1-(xx+yy)]];
-}
+const camPanels = {};
 
 function buildCamPanels(camNames) {
   const grid = $("camgrid");
@@ -453,16 +657,17 @@ function buildCamPanels(camNames) {
     }
     const p = { div, zoomwrap, img, renderer: renderer2, scene: scene2, cam2d,
                 pts: pts2, boxes: boxes2, labels, z: { s: 1, x: 0, y: 0 },
-                w: 960, h: 540, cam };
+                w: 960, h: 540, fit: 1, cam };
     camPanels[cam] = p;
     div.onwheel = e => {
       e.preventDefault();
       const r = div.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      const ds = e.deltaY < 0 ? 1.18 : 1 / 1.18;
-      const s2 = Math.min(30, Math.max(1, p.z.s * ds));
-      p.z.x = mx - (mx - p.z.x) * (s2 / p.z.s);
-      p.z.y = my - (my - p.z.y) * (s2 / p.z.s);
+      const mx = e.clientX - (r.left + r.width / 2);   // vs cell center
+      const my = e.clientY - (r.top + r.height / 2);
+      const s2 = Math.min(30, Math.max(1, p.z.s * (e.deltaY < 0 ? 1.18 : 1 / 1.18)));
+      const k = s2 / p.z.s;
+      p.z.x = mx + (p.z.x - mx) * k;
+      p.z.y = my + (p.z.y - my) * k;
       p.z.s = s2;
       applyZoom(p);
     };
@@ -475,14 +680,17 @@ function buildCamPanels(camNames) {
       applyZoom(p);
     };
     div.onpointerup = () => { drag = null; };
+    div.ondblclick = () => { p.z.s = 1; p.z.x = 0; p.z.y = 0; applyZoom(p); };
   }
 }
 
+// image letterbox-fits its cell at zoom 1; user zoom scales on top
 function applyZoom(p) {
-  p.zoomwrap.style.transform = `translate(${p.z.x}px,${p.z.y}px) scale(${p.z.s})`;
-  const fs = Math.min(48, Math.max(6, 11 * p.z.s));
-  for (const l of p.labels) l.style.fontSize = fs + "px";
-  p.pts.material.size = Math.max(1.2, 2.2 / Math.sqrt(p.z.s));
+  const cell = p.div.getBoundingClientRect();
+  p.fit = Math.min(cell.width / p.w, cell.height / p.h) || 1;
+  const s = p.fit * p.z.s;
+  p.zoomwrap.style.transform =
+    `translate(-50%, -50%) translate(${p.z.x}px, ${p.z.y}px) scale(${s})`;
 }
 
 function setupCamPanelSize(p, w, h) {
@@ -500,6 +708,7 @@ function renderCamPanel(p, data) {
   p.div.style.display = "";
   const w0 = cd.w, h0 = cd.h;
   if (p.w !== w0 || p.h !== h0) setupCamPanelSize(p, w0, h0);
+  applyZoom(p);
   const imgUrl = `/api/camimg?sweep=${state.sweep}&cam=${p.cam}&ts=${cd.ts}`;
   if (p.img.dataset.cur !== imgUrl) { p.img.src = imgUrl; p.img.dataset.cur = imgUrl; }
 
@@ -526,6 +735,7 @@ function renderCamPanel(p, data) {
   p.pts.geometry.setAttribute("position", new THREE.BufferAttribute(uv.subarray(0, mm*3), 3));
   p.pts.geometry.setAttribute("color", new THREE.BufferAttribute(col.subarray(0, mm*3), 3));
   p.pts.visible = state.showLidar && mm > 0;
+  p.pts.material.size = 2.2;
 
   const idx = visibleBoxes(data);
   const labels = data.header.labels, cols = classColorsFor(labels);
@@ -557,7 +767,7 @@ function renderCamPanel(p, data) {
         bpos.set([uvs[bb][0], uvs[bb][1], 0], segs*3); bcol.set(c, segs*3); segs++;
       }
       let top = uvs[4];
-      for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];  // min screen-y = top
+      for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];
       labelInfo.push({ k, x: top[0], y: top[1] });
     }
   }
@@ -576,13 +786,13 @@ function renderCamPanel(p, data) {
   p.renderer.render(p.scene, p.cam2d);
 }
 
-// ------------------------------------------------------------ map
+// ------------------------------------------------------------ map (Leaflet)
 let leaflet = null, trackLine = null, trackDone = null, posMarker = null;
 function initMap() {
-  leaflet = L.map("map", { attributionControl: false }).setView([37.422, -122.16], 16);
+  leaflet = L.map("map", { attributionControl: false }).setView([37.422, -122.16], 14);
   L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", { maxZoom: 19 }).addTo(leaflet);
-  trackLine = L.polyline([], { color: "#3af", weight: 3, opacity: 0.45 }).addTo(leaflet);
-  trackDone = L.polyline([], { color: "#3df", weight: 3 }).addTo(leaflet);
+  trackLine = L.polyline([], { color: "#4aa8ff", weight: 4, opacity: 0.9 }).addTo(leaflet);
+  trackDone = L.polyline([], { color: "#ffe14d", weight: 4 }).addTo(leaflet);
   const icon = L.divIcon({
     className: "",
     html: `<div id="ego-arrow"><svg width="26" height="26" viewBox="-13 -13 26 26">
@@ -599,9 +809,7 @@ function initMap() {
       const d = (q.x - pp.x) ** 2 + (q.y - pp.y) ** 2;
       if (d < bd) { bd = d; best = i; }
     }
-    if (best >= 0 && bd < 400) {      // within ~20 px
-      setFrame(best);
-    }
+    if (best >= 0 && bd < 400) setFrame(best);
   });
 }
 
@@ -635,6 +843,7 @@ function drawTimeline() {
   const c = $("timeline");
   const dpr = window.devicePixelRatio || 1;
   const w = c.clientWidth * dpr, h = c.clientHeight * dpr;
+  if (!w || !h) return;
   if (c.width !== w || c.height !== h) { c.width = w; c.height = h; }
   const g = c.getContext("2d");
   g.clearRect(0, 0, w, h);
@@ -670,10 +879,28 @@ $("timeline").addEventListener("click", e => {
   setFrame(Math.round((e.clientX - r.left) / r.width * (state.frames - 1)));
 });
 
-// ------------------------------------------------------------ legend
-function buildLegend() {
-  const body = $("legendBody");
+// ------------------------------------------------------------ classes popover
+function buildClasses() {
+  const body = $("classesBody");
   body.innerHTML = "";
+  if (state.colorMode === "semseg") {
+    $("classesTitle").textContent = "semseg classes";
+    const entries = Object.entries(state.semsegClasses).sort((a, b) => a[0] - b[0]);
+    if (!entries.length) {
+      body.innerHTML = "<div style='color:#7d8f9d;padding:2px 4px'>no semseg classes</div>";
+      return;
+    }
+    for (const [id, name] of entries) {
+      const p = SEMSEG_PALETTE[+id] || [128, 128, 128];
+      const chip = document.createElement("div");
+      chip.className = "chip";
+      chip.innerHTML = `<span class="sw" style="background:rgb(${p[0]},${p[1]},${p[2]})"></span>` +
+        `<span>${name}</span>`;
+      body.append(chip);
+    }
+    return;
+  }
+  $("classesTitle").textContent = "box classes (click to filter)";
   const entries = Object.entries(state.boxClasses).sort((a, b) => b[1] - a[1]);
   if (!entries.length) {
     body.innerHTML = "<div style='color:#7d8f9d;padding:2px 4px'>no boxes in sequence</div>";
@@ -688,38 +915,10 @@ function buildLegend() {
     chip.onclick = () => {
       if (state.hiddenClasses.has(name)) state.hiddenClasses.delete(name);
       else state.hiddenClasses.add(name);
-      buildLegend();
+      buildClasses();
       render();
     };
     body.append(chip);
-  }
-}
-
-function buildSemsegLegend() {
-  const body = $("legendBody");
-  body.innerHTML = "";
-  const entries = Object.entries(state.semsegClasses).sort((a, b) => a[0] - b[0]);
-  if (!entries.length) {
-    body.innerHTML = "<div style='color:#7d8f9d;padding:2px 4px'>no semseg classes</div>";
-    return;
-  }
-  for (const [id, name] of entries) {
-    const p = SEMSEG_PALETTE[+id] || [128, 128, 128];
-    const chip = document.createElement("div");
-    chip.className = "chip";
-    chip.innerHTML = `<span class="sw" style="background:rgb(${p[0]},${p[1]},${p[2]})"></span>` +
-      `<span>${name}</span>`;
-    body.append(chip);
-  }
-}
-
-function refreshLegend() {
-  if (state.colorMode === "semseg") {
-    $("legendTitle").textContent = "semseg classes";
-    buildSemsegLegend();
-  } else {
-    $("legendTitle").textContent = "box classes";
-    buildLegend();
   }
 }
 
@@ -729,20 +928,23 @@ function syncUrl() {
   history.replaceState(null, "", `/?seq=${name}&frame=${state.frame}`);
 }
 
-function setFrame(f, keepUrl) {
+function setFrame(f) {
   state.frame = Math.max(0, Math.min(f, state.frames - 1));
   $("slider").value = state.frame;
   prefetch();
   render();
-  if (!keepUrl) syncUrl();
+  syncUrl();
 }
 
 async function selectSweep(i, frame = 0) {
   state.sweep = i;
   state.gpsTrackDrawn = [];
   state.cache.clear();
+  bevView.z = 1; bevView.x = 0; bevView.y = 0;
   $("loading").classList.add("show");
-  const meta = await api(`/api/meta?sweep=${i}`);
+  const [meta, track] = await Promise.all([
+    api(`/api/meta?sweep=${i}`), api(`/api/gps_track?sweep=${i}`),
+  ]);
   state.frames = meta.frames;
   state.hasSemseg = meta.has_semseg;
   state.semsegClasses = meta.semseg_classes;
@@ -754,16 +956,14 @@ async function selectSweep(i, frame = 0) {
   state.frame = Math.min(frame, meta.frames - 1);
   $("slider").max = Math.max(0, meta.frames - 1);
   buildCamPanels(meta.cameras);
-  refreshLegend();
-  // gps track + timeline
-  state.track = await api(`/api/gps_track?sweep=${i}`);
+  buildClasses();
+  state.track = track;
   const pts = [];
-  for (let k = 0; k < state.track.lat.length; k++)
-    pts.push([state.track.lat[k], state.track.lon[k]]);
+  for (let k = 0; k < track.lat.length; k++)
+    if (track.lat[k] || track.lon[k]) pts.push([track.lat[k], track.lon[k]]);
   trackLine.setLatLngs(pts);
   trackDone.setLatLngs([]);
-  const first = pts.find(p => p[0] || p[1]) || [37.422, -122.16];
-  leaflet.setView(first, 16);
+  if (pts.length > 1) leaflet.fitBounds(L.latLngBounds(pts).pad(0.08));
   drawTimeline();
   $("loading").classList.remove("show");
   prefetch();
@@ -776,8 +976,7 @@ let renderSeq = 0;
 async function render() {
   const s = state.sweep, f = state.frame, seq = ++renderSeq;
   const data = await loadFrame(s, f).catch(() => null);
-  // discard only if the sweep changed or a newer render superseded this one;
-  // while playing the frame may legitimately have advanced during the fetch
+  // discard only if the sweep changed or a newer render superseded this one
   if (!data || seq !== renderSeq || state.sweep !== s) return;
   const nShown = render3d(data);
   if (state.showBev) { $("bev-wrap").style.display = ""; renderBev(data); }
@@ -794,6 +993,7 @@ async function render() {
   $("boxLbl").textContent = `boxes ${visibleBoxes(data).length}`;
   $("netLbl").textContent = `${state.lastLoadMs.toFixed(0)} ms · ${(state.netKB / 1024).toFixed(1)} MiB`;
 }
+function requestRender() { render(); }
 
 // ------------------------------------------------------------ main loop
 let lastAdvance = 0, fpsCnt = 0, fpsT0 = performance.now();
@@ -824,6 +1024,7 @@ function resize() {
   renderer.setSize(w, h, false);
   cam3.aspect = w / h;
   cam3.updateProjectionMatrix();
+  for (const cam of CAM_ORDER) if (camPanels[cam]) applyZoom(camPanels[cam]);
   drawTimelineCursor();
 }
 window.addEventListener("resize", resize);
@@ -844,13 +1045,14 @@ $("chkBoxes").onchange = e => { state.showBoxes = e.target.checked; render(); };
 $("chkCamLbl").onchange = e => { state.showCamLbl = e.target.checked; render(); };
 $("chkFollow").onchange = e => { state.followMap = e.target.checked; };
 $("chkNms").onchange = e => { state.showNms = e.target.checked; state.cache.clear(); render(); };
-$("chkFrustum").onchange = e => { state.showFrustum = e.target.checked; render(); };
+$("chkMap3d").onchange = e => { state.showMap3d = e.target.checked; render(); };
+$("chkMapBev").onchange = e => { state.showMapBev = e.target.checked; render(); };
 $("chkGrid").onchange = e => { state.showGrid = e.target.checked; render(); };
 $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render(); };
 $("chkBev").onchange = e => { state.showBev = e.target.checked; render(); };
 $("colorMode").onchange = e => {
   state.colorMode = e.target.value;
-  refreshLegend();
+  buildClasses();
   render();
 };
 $("ptSize").oninput = e => { state.ptSize = +e.target.value / 100; render(); };
@@ -862,6 +1064,15 @@ $("rangeClip").oninput = e => {
 };
 $("sweepSel").onchange = e => selectSweep(+e.target.value);
 $("slider").oninput = e => { pause(); setFrame(+e.target.value); };
+$("btnClasses").onclick = e => {
+  e.stopPropagation();
+  $("classes-pop").hidden = !$("classes-pop").hidden;
+};
+document.addEventListener("click", e => {
+  const pop = $("classes-pop");
+  if (!pop.hidden && !pop.contains(e.target) && e.target.id !== "btnClasses")
+    pop.hidden = true;
+});
 $("btnHelp").onclick = () => $("help").hidden = !$("help").hidden;
 $("btnHelpClose").onclick = () => $("help").hidden = true;
 
@@ -877,9 +1088,9 @@ window.addEventListener("keydown", e => {
       ? ["height", "intensity", "range", "semseg"] : ["height", "intensity", "range"];
     const m = modes[(modes.indexOf(state.colorMode) + 1) % modes.length];
     $("colorMode").value = m; state.colorMode = m;
-    refreshLegend(); render();
+    buildClasses(); render();
   } else if (e.key === "h" || e.key === "?") $("help").hidden = !$("help").hidden;
-  else if (e.key === "Escape") $("help").hidden = true;
+  else if (e.key === "Escape") { $("help").hidden = true; $("classes-pop").hidden = true; }
 });
 
 // ------------------------------------------------------------ init

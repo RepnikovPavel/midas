@@ -29,22 +29,18 @@
 
       <div id="bev-wrap">
         <div class="panel-hdr">
-          <span>BEV</span>
+          <span>BEV &middot; wheel zoom &middot; drag pan &middot; dblclick reset</span>
           <span id="bevRange">60 m</span>
         </div>
         <canvas id="bev" width="640" height="640"></canvas>
-      </div>
-
-      <div id="legend" class="panel">
-        <div class="panel-hdr"><span id="legendTitle">classes</span></div>
-        <div id="legendBody"></div>
       </div>
 
       <div id="hud3d" class="panel">
         <label>point size <input type="range" id="ptSize" min="2" max="20" value="6"></label>
         <label>range clip <input type="range" id="rangeClip" min="10" max="120" value="120"
           step="5"><span id="rangeClipLbl">&#8734;</span></label>
-        <label><input type="checkbox" id="chkFrustum" checked> camera frustums</label>
+        <label><input type="checkbox" id="chkMap3d" checked> map on ground</label>
+        <label><input type="checkbox" id="chkMapBev" checked> map in BEV</label>
         <label><input type="checkbox" id="chkGrid" checked> grid</label>
         <label><input type="checkbox" id="chkLabels3d" checked> box labels</label>
         <label><input type="checkbox" id="chkBev" checked> BEV radar</label>
@@ -76,12 +72,17 @@
         <label><input type="checkbox" id="chkLidar" checked> LiDAR proj</label>
         <label><input type="checkbox" id="chkBoxes" checked> Boxes proj</label>
         <label><input type="checkbox" id="chkCamLbl" checked> cam labels</label>
-        <label><input type="checkbox" id="chkFollow" checked> follow map</label>
+        <label><input type="checkbox" id="chkFollow"> follow map</label>
         <label title="show all cuboids (no BEV NMS dedup)"><input type="checkbox" id="chkNms" checked> NMS</label>
+        <button id="btnClasses" title="show / hide object classes">classes</button>
         <div id="timeline-wrap">
           <canvas id="timeline"></canvas>
           <input type="range" id="slider" min="0" max="0" value="0">
         </div>
+      </div>
+      <div id="classes-pop" class="panel" hidden>
+        <div class="panel-hdr"><span id="classesTitle">classes</span></div>
+        <div id="classesBody"></div>
       </div>
     </div>
   </div>
@@ -95,11 +96,12 @@
         <tr><td><kbd>N</kbd> / <kbd>B</kbd></td><td>next / previous sequence</td></tr>
         <tr><td><kbd>c</kbd></td><td>cycle point color mode</td></tr>
         <tr><td><kbd>h</kbd></td><td>toggle this help</td></tr>
-        <tr><td><kbd>mouse</kbd></td><td>3D: orbit / wheel zoom; camera panes: wheel zoom to cursor, drag to pan</td></tr>
-        <tr><td><kbd>map</kbd></td><td>click on the GPS track to jump to the nearest frame</td></tr>
-        <tr><td><kbd>legend</kbd></td><td>click a class chip to show/hide that object class</td></tr>
+        <tr><td><kbd>mouse</kbd></td><td>3D: orbit / wheel zoom; BEV: wheel zoom to cursor, drag pan, double-click resets; camera panes: wheel zoom to cursor, drag to pan</td></tr>
+        <tr><td><kbd>map</kbd></td><td>click on the GPS track to jump to the nearest frame; the whole route is fitted on sequence load</td></tr>
+        <tr><td><kbd>classes</kbd></td><td>the "classes" button opens class filters (click a chip to show/hide that class)</td></tr>
       </table>
-      <p>Ego frame: X forward, Y left, Z up. Boxes: x y z dx dy dz yaw.</p>
+      <p>Ego frame: X forward, Y left, Z up. Boxes: x y z dx dy dz yaw.
+         Map tiles &copy; OpenStreetMap (loaded online, positioned by dataset GPS).</p>
       <button id="btnHelpClose">close</button>
     </div>
   </div>

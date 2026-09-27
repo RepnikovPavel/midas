@@ -22,31 +22,22 @@ label { user-select: none; }
 #main { display: flex; flex: 1; min-height: 0; }
 #view3d-wrap { flex: 1.35; min-width: 0; position: relative; }
 #view3d { width: 100%; height: 100%; display: block; }
-#side { flex: 1; display: flex; flex-direction: column; min-width: 0; }
+#side { flex: 1; display: flex; flex-direction: column; min-width: 0; position: relative; }
 
 /* ---------- floating panels over 3D ---------- */
-.panel { position: absolute; background: rgba(13, 17, 22, .82);
+.panel { position: absolute; background: rgba(13, 17, 22, .88);
   border: 1px solid #2a333c; border-radius: 6px; backdrop-filter: blur(3px); }
 .panel-hdr { display: flex; justify-content: space-between; gap: 10px;
-  padding: 3px 8px; font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+  padding: 3px 8px; font-size: 11px; letter-spacing: .02em;
   color: #8fa3b2; border-bottom: 1px solid #232b33; }
 
-#bev-wrap { position: absolute; left: 10px; bottom: 10px; width: 240px; height: 240px;
+#bev-wrap { position: absolute; left: 10px; bottom: 10px; width: 250px; height: 250px;
   background: rgba(10, 14, 18, .85); border: 1px solid #46586a; border-radius: 8px;
-  backdrop-filter: blur(3px); overflow: hidden;
+  backdrop-filter: blur(3px); overflow: hidden; cursor: grab;
   box-shadow: 0 0 12px rgba(0, 0, 0, .6); }
+#bev-wrap:active { cursor: grabbing; }
 #bev-wrap .panel-hdr { color: #b8cadb; }
 #bev { width: 100%; height: calc(100% - 20px); display: block; }
-
-#legend { top: 10px; right: 10px; max-width: 210px; max-height: 55%;
-  overflow-y: auto; }
-#legendBody { padding: 5px 7px; display: flex; flex-direction: column; gap: 2px; }
-.chip { display: flex; align-items: center; gap: 6px; cursor: pointer;
-  padding: 1px 3px; border-radius: 3px; }
-.chip:hover { background: #1d242c; }
-.chip.off { opacity: .35; text-decoration: line-through; }
-.chip .sw { width: 11px; height: 11px; border-radius: 2px; flex: none; }
-.chip .cnt { margin-left: auto; color: #7d8f9d; font-size: 11px; }
 
 #hud3d { left: 10px; top: 10px; padding: 6px 9px; display: flex;
   flex-direction: column; gap: 4px; font-size: 12px; }
@@ -57,15 +48,16 @@ label { user-select: none; }
   padding: 4px 16px; display: none; }
 #loading.show { display: block; }
 
-/* ---------- cameras ---------- */
-#camgrid { flex: 3; display: grid; grid-template-columns: repeat(3, 1fr);
-  grid-template-rows: repeat(2, 1fr); gap: 2px; min-height: 0; }
+/* ---------- cameras (letterbox-fit, zoom/pan inside) ---------- */
+/* 2 cols x 3 rows: cells match the 16:9 image aspect of the side column */
+#camgrid { flex: 3; display: grid; grid-template-columns: repeat(2, 1fr);
+  grid-template-rows: repeat(3, 1fr); gap: 2px; min-height: 0; }
 .cam { position: relative; overflow: hidden; background: #000; cursor: crosshair; }
-.cam .zoomwrap { position: absolute; left: 0; top: 0; transform-origin: 0 0; }
+.cam .zoomwrap { position: absolute; left: 50%; top: 50%; transform-origin: 50% 50%; }
 .cam img { position: absolute; left: 0; top: 0; }
 .cam canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
 .cam .lbl { position: absolute; color: #0ff; font-weight: 700; pointer-events: none;
-  text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: nowrap;
+  font-size: 12px; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: nowrap;
   transform: translate(-50%, -100%); }
 .cam .camname { position: absolute; left: 4px; top: 2px; color: #fff; z-index: 5;
   text-shadow: 0 0 4px #000; pointer-events: none; }
@@ -80,9 +72,21 @@ label { user-select: none; }
   background: #13171c; flex-wrap: wrap; }
 #btnPlay { width: 62px; padding: 6px 0; font-weight: 700; cursor: pointer; }
 #btnPrev, #btnNext { cursor: pointer; }
+#btnClasses { cursor: pointer; }
 #timeline-wrap { flex: 1; min-width: 160px; position: relative; height: 34px; }
 #timeline { position: absolute; inset: 0 0 12px 0; width: 100%; height: 22px; }
 #slider { position: absolute; bottom: 0; left: 0; width: 100%; }
+
+/* ---------- classes popover ---------- */
+#classes-pop { position: absolute; right: 8px; bottom: 52px; width: 230px;
+  max-height: 55%; overflow-y: auto; z-index: 20; }
+#classesBody { padding: 5px 7px; display: flex; flex-direction: column; gap: 2px; }
+.chip { display: flex; align-items: center; gap: 6px; cursor: pointer;
+  padding: 1px 3px; border-radius: 3px; }
+.chip:hover { background: #1d242c; }
+.chip.off { opacity: .35; text-decoration: line-through; }
+.chip .sw { width: 11px; height: 11px; border-radius: 2px; flex: none; }
+.chip .cnt { margin-left: auto; color: #7d8f9d; font-size: 11px; }
 
 /* ---------- help ---------- */
 #help { position: fixed; inset: 0; background: rgba(4, 6, 9, .72); z-index: 1000;
