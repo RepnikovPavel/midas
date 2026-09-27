@@ -1439,9 +1439,14 @@ async function loadAcc() {
     let off = 4 + hl;
     const tracks = {};
     for (const [tid, t] of Object.entries(header.tracks)) {
-      const pts16 = new Uint16Array(buf, off + t.pts_off, t.n * 3);
-      const birth = new Uint16Array(buf, off + header.__pts_bytes + t.birth_off, t.n);
-      tracks[tid] = { dims: t.dims, n: t.n, pts: decodeF16(pts16, t.n * 3), birth };
+      const segs = [];
+      for (const sg of t.segs) {
+        const pts16 = new Uint16Array(buf, off + sg.po, sg.n * 3);
+        const birth = new Uint16Array(buf, off + header.__pts_bytes + sg.bo, sg.n);
+        segs.push({ sensor: sg.s, f0: sg.f0, n: sg.n,
+                    pts: decodeF16(pts16, sg.n * 3), birth });
+      }
+      tracks[tid] = { dims: t.dims, segs };
     }
     state.accTracks = tracks;
     state.accSweep = state.sweep;
@@ -1486,11 +1491,16 @@ function accPointsEgo(data, forBev) {
     if (labels[k] !== "Car") continue;
     const t = state.accTracks[ids[k]];
     if (!t) continue;
+    // zone of responsibility: the LAST segment that started at/before frame t
+    // (points inside never mix the two sensors' geometries)
+    let seg = t.segs[0];
+    for (const sg of t.segs) if (sg.f0 <= state.frame) seg = sg;
+    if (state.frame < seg.f0) continue;
     const b = data.boxes.subarray(k * 7, k * 7 + 7);
     const cA = Math.cos(b[6]), sA = Math.sin(b[6]);
-    for (let i = 0; i < t.n; i++) {
-      if (t.birth[i] > state.frame) continue;   // one-directional: birth <= t
-      const lx = t.pts[i*3], ly = t.pts[i*3+1], lz = t.pts[i*3+2];
+    for (let i = 0; i < seg.n; i++) {
+      if (seg.birth[i] > state.frame) continue;   // one-directional: birth <= t
+      const lx = seg.pts[i*3], ly = seg.pts[i*3+1], lz = seg.pts[i*3+2];
       const x = cA * lx - sA * ly + b[0];
       const y = sA * lx + cA * ly + b[1];
       const z = lz + b[2];

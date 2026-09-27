@@ -470,6 +470,8 @@ def make_app(roots, osm_dir=None):
                             for u, t in header["tracks"].items()}
         header["__pts_bytes"] = len(pts_blob)
         hj = json.dumps(header).encode()
+        if len(hj) % 4:          # keep fp16 blobs 2-byte aligned
+            hj += b" " * (4 - len(hj) % 4)
         body = (struct.pack("<I", len(hj)) + hj + pts_blob + birth_blob)
         if len(app["acc_cache"]) > 4:
             app["acc_cache"].clear()
