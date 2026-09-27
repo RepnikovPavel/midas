@@ -973,12 +973,44 @@ function renderCamPanel(p, data) {
   const m = rangeMask(data), n = data.header.n, pts = data.points;
   const colors = pointColors(data, state.colorMode, state.rangeClip, false);
   const R = quatToMat(cd.R), t = cd.t, K = cd.K;
+  // ego-motion compensation: points live in the ego frame of the LIDAR frame
+  // ts; the photo was taken at ts_cam (async sensors). Map every point
+  // world -> ego(t_cam) so points, boxes and photo share the same instant.
+  const e2g = data.header.e2g;
+  let Mp = null;   // 3x4 ego(frame) -> ego(t_cam)
+  if (e2g && cd.ib_e2g) {
+    const Rfw = quatToMat(e2g.slice(3, 7)), tfw = e2g.slice(0, 3);
+    const Rw2e = quatToMat(cd.ib_e2g.slice(3, 7)), tw2 = cd.ib_e2g.slice(0, 3);
+    Mp = [
+      [Rw2e[0][0]*Rfw[0][0] + Rw2e[1][0]*Rfw[1][0] + Rw2e[2][0]*Rfw[2][0],
+       Rw2e[0][0]*Rfw[0][1] + Rw2e[1][0]*Rfw[1][1] + Rw2e[2][0]*Rfw[2][1],
+       Rw2e[0][0]*Rfw[0][2] + Rw2e[1][0]*Rfw[1][2] + Rw2e[2][0]*Rfw[2][2]],
+      [Rw2e[0][1]*Rfw[0][0] + Rw2e[1][1]*Rfw[1][0] + Rw2e[2][1]*Rfw[2][0],
+       Rw2e[0][1]*Rfw[0][1] + Rw2e[1][1]*Rfw[1][1] + Rw2e[2][1]*Rfw[2][1],
+       Rw2e[0][1]*Rfw[0][2] + Rw2e[1][1]*Rfw[1][2] + Rw2e[2][1]*Rfw[2][2]],
+      [Rw2e[0][2]*Rfw[0][0] + Rw2e[1][2]*Rfw[1][0] + Rw2e[2][2]*Rfw[2][0],
+       Rw2e[0][2]*Rfw[0][1] + Rw2e[1][2]*Rfw[1][1] + Rw2e[2][2]*Rfw[2][1],
+       Rw2e[0][2]*Rfw[0][2] + Rw2e[1][2]*Rfw[1][2] + Rw2e[2][2]*Rfw[2][2]],
+    ];
+    const pw = [ // world position of ego(frame) origin = tfw; shift vector
+      Mp[0][0]*tfw[0] + Mp[0][1]*tfw[1] + Mp[0][2]*tfw[2],
+      Mp[1][0]*tfw[0] + Mp[1][1]*tfw[1] + Mp[1][2]*tfw[2],
+      Mp[2][0]*tfw[0] + Mp[2][1]*tfw[1] + Mp[2][2]*tfw[2]];
+    Mp[0][3] = pw[0] - tw2[0]; Mp[1][3] = pw[1] - tw2[1]; Mp[2][3] = pw[2] - tw2[2];
+  }
   const uv = new Float32Array(n * 3), col = new Float32Array(n * 3);
   let mm = 0;
   if (state.showLidar) {
     for (let i = 0; i < n; i++) {
       if (!m[i]) continue;
-      const ex = pts[i*3] - t[0], ey = pts[i*3+1] - t[1], ez = pts[i*3+2] - t[2];
+      let ex = pts[i*3], ey = pts[i*3+1], ez = pts[i*3+2];
+      if (Mp) {
+        const nx = Mp[0][0]*ex + Mp[0][1]*ey + Mp[0][2]*ez + Mp[0][3];
+        const ny = Mp[1][0]*ex + Mp[1][1]*ey + Mp[1][2]*ez + Mp[1][3];
+        const nz = Mp[2][0]*ex + Mp[2][1]*ey + Mp[2][2]*ez + Mp[2][3];
+        ex = nx; ey = ny; ez = nz;
+      }
+      ex -= t[0]; ey -= t[1]; ez -= t[2];
       const cz = R[0][2]*ex + R[1][2]*ey + R[2][2]*ez;
       if (cz < 0.5) continue;
       const cx = R[0][0]*ex + R[1][0]*ey + R[2][0]*ez;
