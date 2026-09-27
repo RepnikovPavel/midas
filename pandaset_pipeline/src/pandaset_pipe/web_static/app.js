@@ -359,7 +359,8 @@ function mapPatch(header) {
 
 // ------------------------------------------------------------ 3D scene
 const canvas3d = $("view3d");
-const renderer = new THREE.WebGLRenderer({ canvas: canvas3d, antialias: true });
+const renderer = new THREE.WebGLRenderer({ canvas: canvas3d, antialias: true,
+                                           preserveDrawingBuffer: true });
 const scene3 = new THREE.Scene();
 scene3.background = new THREE.Color(0x0b0e11);
 const cam3 = new THREE.PerspectiveCamera(50, 1, 0.1, 2000);
@@ -398,7 +399,8 @@ scene3.add(roads3);
 const mapPlane = new THREE.Mesh(
   new THREE.PlaneGeometry(1, 1),
   new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9,
-                                depthWrite: false, depthTest: false }));
+                                depthWrite: false, depthTest: false,
+                                side: THREE.DoubleSide }));
 mapPlane.renderOrder = -2;
 mapPlane.visible = false;
 scene3.add(mapPlane);
@@ -770,33 +772,34 @@ function renderBev(data) {
     bevCtx.stroke();
   }
 
-  // ---- compact radius scale (ticks up the ego axis, meters) ----
+  // ---- compact radius scale: distance labels on all 4 semi-axes ----
   if (state.showBevScale) {
     const [ex0, ey0] = px(0, 0);
-    const ax = ex0, fs = 15;
+    const fs = 15;
     bevCtx.font = `bold ${fs}px ui-monospace, monospace`;
     bevCtx.textBaseline = "middle";
-    bevCtx.textAlign = "left";
     for (let r = step; r <= visR; r += step) {
-      const y = ey0 - r * scale;
-      if (y < 14 || y > W - 6) continue;
-      bevCtx.strokeStyle = "rgba(160,180,195,0.9)";
-      bevCtx.lineWidth = 2;
-      bevCtx.beginPath();
-      bevCtx.moveTo(ax - 5, y); bevCtx.lineTo(ax + 5, y);
-      bevCtx.stroke();
-      const lab = String(r);
-      const tw = bevCtx.measureText(lab).width;
-      bevCtx.fillStyle = "rgba(10,14,18,0.72)";
-      bevCtx.fillRect(ax + 7, y - fs / 2 - 1, tw + 4, fs + 2);
-      bevCtx.fillStyle = "#cfe0ee";
-      bevCtx.fillText(lab, ax + 9, y);
+      for (const dir of [[1, 0], [-1, 0], [0, -1], [0, 1]]) {  // up/down/left/right
+        const x = ex0 + dir[0] * r * scale;
+        const y = ey0 + dir[1] * r * scale;
+        if (x < 30 || x > W - 30 || y < 26 || y > W - 12) continue;
+        bevCtx.strokeStyle = "rgba(160,180,195,0.9)";
+        bevCtx.lineWidth = 2;
+        bevCtx.beginPath();
+        // tick across the axis direction
+        bevCtx.moveTo(x - 5 * dir[1], y - 5 * dir[0]);
+        bevCtx.lineTo(x + 5 * dir[1], y + 5 * dir[0]);
+        bevCtx.stroke();
+        const lab = String(r);
+        bevCtx.textAlign = "center";
+        const tw = bevCtx.measureText(lab).width;
+        const lx = x + dir[0] * 10, ly = y + dir[1] * 10;
+        bevCtx.fillStyle = "rgba(10,14,18,0.72)";
+        bevCtx.fillRect(lx - tw / 2 - 3, ly - fs / 2 - 1, tw + 6, fs + 2);
+        bevCtx.fillStyle = "#cfe0ee";
+        bevCtx.fillText(lab, lx, ly);
+      }
     }
-    // unit label
-    bevCtx.fillStyle = "rgba(10,14,18,0.72)";
-    bevCtx.fillRect(ax + 7, 10, 18, fs + 2);
-    bevCtx.fillStyle = "#9fb6c6";
-    bevCtx.fillText("m", ax + 11, 10 + (fs + 2) / 2);
     bevCtx.textAlign = "start";
     bevCtx.textBaseline = "alphabetic";
   }
