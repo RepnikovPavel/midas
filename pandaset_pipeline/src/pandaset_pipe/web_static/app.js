@@ -78,7 +78,8 @@ const state = {
   showLidar: true, showBoxes: true, showCamLbl: true, showNms: true,
   showMap3d: true, showMapBev: true, showGrid: false, showLabels3d: true,
   showBev: true, showRoads: true, showBevScale: true, gridStep: 10, followMap: true,
-  showTrackId: false, ptSize: 0.06, rangeClip: Infinity,
+  showTrackId: false, accPts: false, accTracks: null, accSweep: -1,
+  ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
   hiddenClasses: new Set(), classColors: {},
   track: null,               // gps track + world<->ENU alignment of current sweep
@@ -196,10 +197,23 @@ function rangeMask(data) {
   return m;
 }
 
+// range mask AND acc-exclusion (points inside accumulated Car boxes are
+// replaced by the accumulated cloud of that track)
+function displayMask(data) {
+  if (!(state.accPts && state.accTracks)) return rangeMask(data);
+  const ck = "dmask:" + state.rangeClip + ":" + state.frame;
+  if (data.colors[ck]) return data.colors[ck];
+  const m = rangeMask(data).slice();
+  const keep = accExcludeMask(data);
+  if (keep) for (let i = 0; i < m.length; i++) m[i] &= keep[i];
+  data.colors[ck] = m;
+  return m;
+}
+
 function clippedPoints(data, colors, dark) {
   const ck = "cp:" + state.colorMode + ":" + state.rangeClip + ":" + (dark ? 1 : 0);
   if (data.colors[ck]) return data.colors[ck];
-  const m = rangeMask(data), pts = data.points, n = data.header.n;
+  const m = displayMask(data), pts = data.points, n = data.header.n;
   let c = 0; for (let i = 0; i < n; i++) c += m[i];
   const pos = new Float32Array(c * 3), col = new Float32Array(c * 3);
   let j = 0;
@@ -444,6 +458,15 @@ const boxes3 = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({
   vertexColors: true, transparent: true, opacity: 1 }));
 scene3.add(boxes3);
 
+// accumulated per-track points (acc pts mode)
+const accGeo = new THREE.BufferGeometry();
+accGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
+accGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
+const accPoints3 = new THREE.Points(accGeo, new THREE.PointsMaterial({
+  size: 0.05, vertexColors: true, sizeAttenuation: true,
+  transparent: true, opacity: 1 }));
+scene3.add(accPoints3);
+
 // box labels as sprites
 const labelTexCache = new Map();
 function labelTexture(text, css) {
@@ -563,6 +586,15 @@ function render3d(data) {
     }
   }
   for (; li < labelSprites.length; li++) labelSprites[li].visible = false;
+
+  // ---- accumulated per-track points (inside Car boxes) ----
+  if (state.accPts && state.accTracks) {
+    const a = accPointsEgo(data, false);
+    accGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(a.pos), 3));
+    accGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(a.col), 3));
+    accGeo.computeBoundingSphere();
+    accPoints3.visible = a.pos.length > 0;
+  } else accPoints3.visible = false;
 
   grid3.visible = state.showGrid;
 
@@ -749,7 +781,7 @@ function renderBev(data) {
 
   // ---- points (offscreen ImageData, composed over the map) ----
   const colors = pointColors(data, state.colorMode, state.rangeClip, state.showMapBev);
-  const m = rangeMask(data), pts = data.points, n = data.header.n;
+  const m = displayMask(data), pts = data.points, n = data.header.n;
   if (!bevImgData || bevImgData.width !== W)
     bevImgData = bevPtsCtx.createImageData(W, W);
   const img = bevImgData, d = img.data;
@@ -765,6 +797,22 @@ function renderBev(data) {
     for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
       const q = ((pyy + oy) * W + pxx + ox) * 4;
       d[q] = r; d[q + 1] = g; d[q + 2] = b; d[q + 3] = 255;
+    }
+  }
+  // accumulated per-track points in BEV
+  if (state.accPts && state.accTracks) {
+    const a = accPointsEgo(data, true);
+    for (let i = 0; i < a.pos.length; i += 3) {
+      const pxx = (cx + bevView.x - a.pos[i + 1] * scale) | 0;
+      const pyy = (cy + bevView.y - a.pos[i] * scale) | 0;
+      if (pxx < 0 || pxx >= W - 1 || pyy < 0 || pyy >= W - 1) continue;
+      const r = Math.min(255, a.col[i] * 255 * 1.25) | 0,
+            g = Math.min(255, a.col[i + 1] * 255 * 1.25) | 0,
+            b2 = Math.min(255, a.col[i + 2] * 255 * 1.25) | 0;
+      for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
+        const q = ((pyy + oy) * W + pxx + ox) * 4;
+        d[q] = r; d[q + 1] = g; d[q + 2] = b2; d[q + 3] = 255;
+      }
     }
   }
   bevPtsCtx.putImageData(img, 0, 0);
@@ -1372,6 +1420,89 @@ $("chkRoads").onchange = e => { state.showRoads = e.target.checked; render(); };
 $("chkBevScale").onchange = e => { state.showBevScale = e.target.checked; render(); };
 $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render(); };
 $("chkTrackId").onchange = e => { state.showTrackId = e.target.checked; render(); };
+$("chkAccPts").onchange = e => {
+  state.accPts = e.target.checked;
+  if (state.accPts) loadAcc();
+  else render();
+};
+
+// one-directional per-track point accumulation (server: accpoints.py)
+async function loadAcc() {
+  if (state.accTracks && state.accSweep === state.sweep) { render(); return; }
+  state.accTracks = null;
+  try {
+    const r = await fetch(`/api/acc?sweep=${state.sweep}`);
+    const buf = await r.arrayBuffer();
+    const dv = new DataView(buf);
+    const hl = dv.getUint32(0, true);
+    const header = JSON.parse(new TextDecoder().decode(new Uint8Array(buf, 4, hl)));
+    let off = 4 + hl;
+    const tracks = {};
+    for (const [tid, t] of Object.entries(header.tracks)) {
+      const pts16 = new Uint16Array(buf, off + t.pts_off, t.n * 3);
+      const birth = new Uint16Array(buf, off + header.__pts_bytes + t.birth_off, t.n);
+      tracks[tid] = { dims: t.dims, n: t.n, pts: decodeF16(pts16, t.n * 3), birth };
+    }
+    state.accTracks = tracks;
+    state.accSweep = state.sweep;
+  } catch (e) { /* keep null */ }
+  render();
+}
+
+// per-point exclusion mask: points inside accumulated Car boxes are replaced
+// by that track's accumulated cloud
+function accExcludeMask(data) {
+  const n = data.header.n, pts = data.points;
+  const ids = data.header.ids || [], labels = data.header.labels;
+  let keep = null;
+  for (const k of visibleBoxes(data)) {
+    if (labels[k] !== "Car") continue;
+    const t = state.accTracks[ids[k]];
+    if (!t) continue;
+    const b = data.boxes.subarray(k * 7, k * 7 + 7);
+    const cA = Math.cos(b[6]), sA = Math.sin(b[6]);
+    const rBound = (b[3] + b[4]) / 2;   // bounding-circle pretest
+    if (keep === null) keep = new Uint8Array(n).fill(1);
+    for (let i = 0; i < n; i++) {
+      if (!keep[i]) continue;
+      const dx = pts[i*3] - b[0], dy = pts[i*3+1] - b[1];
+      if (dx*dx + dy*dy > rBound * rBound) continue;
+      const lz = pts[i*3+2] - b[2];
+      if (Math.abs(lz) > b[5] / 2) continue;
+      const lx = cA * dx + sA * dy, ly = -sA * dx + cA * dy;
+      if (Math.abs(lx) <= b[3] / 2 && Math.abs(ly) <= b[4] / 2) keep[i] = 0;
+    }
+  }
+  return keep;   // null = keep everything
+}
+
+// accumulated points of all live Car tracks at the CURRENT frame, ego frame
+function accPointsEgo(data, forBev) {
+  const out = { pos: [], col: [] };
+  const ids = data.header.ids || [], labels = data.header.labels;
+  const dark = forBev ? state.showMapBev : state.showMap3d;
+  const hLut = dark ? VIRIDIS : JET;
+  for (const k of visibleBoxes(data)) {
+    if (labels[k] !== "Car") continue;
+    const t = state.accTracks[ids[k]];
+    if (!t) continue;
+    const b = data.boxes.subarray(k * 7, k * 7 + 7);
+    const cA = Math.cos(b[6]), sA = Math.sin(b[6]);
+    for (let i = 0; i < t.n; i++) {
+      if (t.birth[i] > state.frame) continue;   // one-directional: birth <= t
+      const lx = t.pts[i*3], ly = t.pts[i*3+1], lz = t.pts[i*3+2];
+      const x = cA * lx - sA * ly + b[0];
+      const y = sA * lx + cA * ly + b[1];
+      const z = lz + b[2];
+      out.pos.push(x, y, z);
+      let tt = (z - Z_MIN) / (Z_MAX - Z_MIN);
+      tt = tt < 0 ? 0 : (tt > 0.999 ? 0.999 : tt);
+      const kk = (tt * 255 | 0) * 3;
+      out.col.push(hLut[kk] / 255, hLut[kk+1] / 255, hLut[kk+2] / 255);
+    }
+  }
+  return out;
+}
 $("chkBev").onchange = e => { state.showBev = e.target.checked; render(); };
 $("colorMode").onchange = e => {
   state.colorMode = e.target.value;

@@ -19,6 +19,7 @@ from aiohttp import web
 
 from .reader import PandaDataset
 from . import geofit
+from .accpoints import accumulate_sweep
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "web_static")
 OSM_UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -249,6 +250,7 @@ def make_app(roots, osm_dir=None):
     app["osm_dir"] = osm_dir
     app["gps_cache"] = {}      # sweep idx -> track dict
     app["classes_cache"] = {}  # sweep idx -> {class: count}
+    app["acc_cache"] = {}      # sweep idx -> binary accumulated-points payload
     app["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     async def index(request):
@@ -457,6 +459,30 @@ def make_app(roots, osm_dir=None):
         return web.Response(body=data, content_type="image/png",
                             headers={"Cache-Control": "public, max-age=86400"})
 
+    def _acc_sync(i):
+        """One-directional per-track point accumulation (binary payload)."""
+        if i in app["acc_cache"]:
+            return app["acc_cache"][i]
+        sw = ds[i]
+        header, pts_blob, birth_blob = accumulate_sweep(sw)
+        tid = _track_id_map(sw)
+        header["tracks"] = {str(tid.get(u, -1)): t
+                            for u, t in header["tracks"].items()}
+        header["__pts_bytes"] = len(pts_blob)
+        hj = json.dumps(header).encode()
+        body = (struct.pack("<I", len(hj)) + hj + pts_blob + birth_blob)
+        if len(app["acc_cache"]) > 4:
+            app["acc_cache"].clear()
+        app["acc_cache"][i] = body
+        return body
+
+    async def acc_api(request):
+        i = int(request.query.get("sweep", 0))
+        loop = asyncio.get_event_loop()
+        body = await loop.run_in_executor(app["executor"], _acc_sync, i)
+        return web.Response(body=body, content_type="application/octet-stream",
+                            headers={"Cache-Control": "no-store"})
+
     app.router.add_get("/", index)
     app.router.add_get("/api/sweeps", sweeps)
     app.router.add_get("/api/meta", meta)
@@ -465,6 +491,7 @@ def make_app(roots, osm_dir=None):
     app.router.add_get("/api/camimg", camimg)
     app.router.add_get("/api/osm_plan", osm_plan)
     app.router.add_get("/api/osm_roads", osm_roads)
+    app.router.add_get("/api/acc", acc_api)
     app.router.add_get("/api/tile/{z}/{x}/{y}.png", tile)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     return app
