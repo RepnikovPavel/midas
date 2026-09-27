@@ -72,6 +72,30 @@ def _quat_slerp(q0, q1, a):
 _SENSOR_TS_CACHE = {}   # (sweep_path, frame_idx) -> {sensor_id: median rel_time}
 
 
+_TRACK_ID_CACHE = {}   # sweep path -> {uuid: int track id (0..N-1, first-appearance order)}
+
+
+def _track_id_map(sw):
+    """Stable per-sweep mapping uuid -> small integer track id (0-based)."""
+    key = sw.path
+    if key in _TRACK_ID_CACHE:
+        return _TRACK_ID_CACHE[key]
+    m = {}
+    for j in range(len(sw)):
+        p = os.path.join(sw.path, f"boxes_{sw.timestamps[j]}.npz")
+        if not os.path.exists(p):
+            continue
+        d = np.load(p, allow_pickle=True)
+        for u in d["uuids"]:
+            us = str(u)
+            if us not in m:
+                m[us] = len(m)
+    if len(_TRACK_ID_CACHE) > 8:
+        _TRACK_ID_CACHE.clear()
+    _TRACK_ID_CACHE[key] = m
+    return m
+
+
 def _sensor_time_offsets(sw, j, cur_idx, cur_offsets):
     """Median rel_time per lidar sensor for frame j (dual-sensor sweeps:
     Pandar64 and PandarGT have different capture times inside one merged
@@ -207,8 +231,9 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
         uuids.append(uuid)
     if not boxes:
         return None
+    tid = _track_id_map(sw)
     return (np.array(boxes, dtype=np.float64), labels, e2g.tolist(),
-            [u[:8] for u in uuids])
+            [str(tid.get(u, -1)) for u in uuids])
 
 
 def make_app(roots, osm_dir=None):
@@ -344,7 +369,7 @@ def make_app(roots, osm_dir=None):
         header = {
             "ts": snap.ts, "n": len(pts), "nb": len(boxes),
             "labels": [str(x) for x in labels],
-            "ids": [str(u)[:8] for u in snap.box_uuids],
+            "ids": [str(_track_id_map(sw).get(str(u), -1)) for u in snap.box_uuids],
             "gps": snap.gps, "cams": cams,
             "frame": j, "frames": len(sw),
             "pts_dtype": str(pts_dtype),
