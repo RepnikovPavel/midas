@@ -56,6 +56,7 @@ label { user-select: none; }
 .cam .zoomwrap { position: absolute; left: 50%; top: 50%; transform-origin: 50% 50%; }
 .cam img { position: absolute; left: 0; top: 0; }
 .cam canvas { position: absolute; left: 0; top: 0; pointer-events: none; }
+.cam canvas.ovl { z-index: 2; }
 .cam .lbl { position: absolute; color: #0ff; font-weight: 700; pointer-events: none;
   font-size: 12px; text-shadow: 0 0 3px #000, 0 0 3px #000; white-space: nowrap;
   transform: translate(-50%, -100%); }

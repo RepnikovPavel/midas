@@ -39,9 +39,18 @@
         <label>point size <input type="range" id="ptSize" min="2" max="20" value="6"></label>
         <label>range clip <input type="range" id="rangeClip" min="10" max="120" value="120"
           step="5"><span id="rangeClipLbl">&#8734;</span></label>
+        <label>grid <input type="checkbox" id="chkGrid" checked> step
+          <select id="gridStep">
+            <option value="1">1 m</option>
+            <option value="2">2 m</option>
+            <option value="5">5 m</option>
+            <option value="10" selected>10 m</option>
+            <option value="20">20 m</option>
+          </select></label>
         <label><input type="checkbox" id="chkMap3d" checked> map on ground</label>
         <label><input type="checkbox" id="chkMapBev" checked> map in BEV</label>
-        <label><input type="checkbox" id="chkGrid" checked> grid</label>
+        <label><input type="checkbox" id="chkRoads" checked> OSM road graph</label>
+        <label><input type="checkbox" id="chkBevScale" checked> BEV radius scale</label>
         <label><input type="checkbox" id="chkLabels3d" checked> box labels</label>
         <label><input type="checkbox" id="chkBev" checked> BEV radar</label>
       </div>
@@ -69,10 +78,10 @@
           <option value="range">range</option>
           <option value="semseg">semseg</option>
         </select>
-        <label><input type="checkbox" id="chkLidar" checked> LiDAR proj</label>
-        <label><input type="checkbox" id="chkBoxes" checked> Boxes proj</label>
-        <label><input type="checkbox" id="chkCamLbl" checked> cam labels</label>
-        <label><input type="checkbox" id="chkFollow"> follow map</label>
+        <label>cam: <input type="checkbox" id="chkLidar" checked> lidar
+          <input type="checkbox" id="chkBoxes" checked> boxes
+          <input type="checkbox" id="chkCamLbl" checked> labels</label>
+        <label><input type="checkbox" id="chkFollow" checked> follow map</label>
         <label title="show all cuboids (no BEV NMS dedup)"><input type="checkbox" id="chkNms" checked> NMS</label>
         <button id="btnClasses" title="show / hide object classes">classes</button>
         <div id="timeline-wrap">

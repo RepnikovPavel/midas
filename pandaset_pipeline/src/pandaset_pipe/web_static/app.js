@@ -7,8 +7,30 @@ const CAM_ORDER = ["front_left_camera", "front_camera", "front_right_camera",
 
 // ------------------------------------------------------------ colormaps
 const clamp255 = v => v < 0 ? 0 : (v > 255 ? 255 : v);
-const TURBO = new Uint8Array(256 * 3);   // range mode
-const JET = new Uint8Array(256 * 3);     // classic height mode
+const TURBO = new Uint8Array(256 * 3);   // range mode (light background)
+const JET = new Uint8Array(256 * 3);     // classic height (light background)
+const VIRIDIS = new Uint8Array(256 * 3); // height over the light OSM raster
+const INFERNO = new Uint8Array(256 * 3); // range over the light OSM raster
+function rampLUT(stops) {  // linear interpolation over control points
+  const lut = new Uint8Array(256 * 3);
+  for (let i = 0; i < 256; i++) {
+    const t = i / 255 * (stops.length - 1);
+    const a = Math.min(stops.length - 2, Math.floor(t)), f = t - a;
+    for (let c = 0; c < 3; c++)
+      lut[i * 3 + c] = clamp255(255 * (stops[a][c] * (1 - f) + stops[a + 1][c] * f));
+  }
+  return lut;
+}
+VIRIDIS.set(rampLUT([
+  [0.267, 0.005, 0.329], [0.283, 0.141, 0.458], [0.254, 0.265, 0.530],
+  [0.207, 0.372, 0.553], [0.164, 0.471, 0.558], [0.128, 0.567, 0.551],
+  [0.135, 0.659, 0.518], [0.267, 0.749, 0.441], [0.478, 0.821, 0.318],
+  [0.741, 0.873, 0.150], [0.993, 0.906, 0.144]]));
+INFERNO.set(rampLUT([
+  [0.001, 0.000, 0.014], [0.087, 0.044, 0.224], [0.258, 0.039, 0.406],
+  [0.416, 0.090, 0.433], [0.578, 0.148, 0.404], [0.735, 0.215, 0.330],
+  [0.866, 0.317, 0.226], [0.955, 0.464, 0.120], [0.988, 0.645, 0.040],
+  [0.965, 0.843, 0.142], [0.988, 0.998, 0.645]]));
 { // polynomial approximation of Google's turbo
   for (let i = 0; i < 256; i++) {
     const t = i / 255;
@@ -55,10 +77,12 @@ const state = {
   playing: true, dataFps: 5, colorMode: "height",
   showLidar: true, showBoxes: true, showCamLbl: true, showNms: true,
   showMap3d: true, showMapBev: true, showGrid: true, showLabels3d: true,
-  showBev: true, followMap: false, ptSize: 0.06, rangeClip: Infinity,
+  showBev: true, showRoads: true, showBevScale: true, gridStep: 10, followMap: true,
+  ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
   hiddenClasses: new Set(), classColors: {},
   track: null,               // gps track + world<->ENU alignment of current sweep
+  roadsENU: null,            // OSM road graph of current sweep, ENU polylines
   gpsTrackDrawn: [],
   cache: new Map(),
   lastLoadMs: 0, netKB: 0,
@@ -134,23 +158,26 @@ function prefetch() {
   for (let f = a; f <= b; f++) loadFrame(state.sweep, f).catch(() => {});
 }
 
-function pointColors(data, mode, clip2) {
-  const ck = mode + ":" + clip2;
+// dark=true selects the high-contrast palette used over the light OSM raster
+function pointColors(data, mode, clip2, dark) {
+  const ck = mode + ":" + clip2 + ":" + (dark ? 1 : 0);
   if (data.colors[ck]) return data.colors[ck];
   const n = data.header.n, pts = data.points;
   const out = new Float32Array(n * 3);
+  const hLut = dark ? VIRIDIS : JET;
+  const rLut = dark ? INFERNO : TURBO;
   for (let i = 0; i < n; i++) {
     let r, g, b;
-    if (mode === "intensity") { r = g = b = data.intensity[i]; }
+    if (mode === "intensity") { r = g = b = dark ? 40 + data.intensity[i] * 0.75 : data.intensity[i]; }
     else if (mode === "semseg") {
       const p = SEMSEG_PALETTE[data.semseg[i]]; r = p[0]; g = p[1]; b = p[2];
     } else if (mode === "range") {
       const d = Math.min(1.999, Math.hypot(pts[i * 3], pts[i * 3 + 1]) / 40);
-      const k = (d | 0) * 3; r = TURBO[k]; g = TURBO[k + 1]; b = TURBO[k + 2];
+      const k = (d | 0) * 3; r = rLut[k]; g = rLut[k + 1]; b = rLut[k + 2];
     } else {
       let t = (pts[i * 3 + 2] - Z_MIN) / (Z_MAX - Z_MIN);
       t = t < 0 ? 0 : (t > 0.999 ? 0.999 : t);
-      const k = (t * 255 | 0) * 3; r = JET[k]; g = JET[k + 1]; b = JET[k + 2];
+      const k = (t * 255 | 0) * 3; r = hLut[k]; g = hLut[k + 1]; b = hLut[k + 2];
     }
     out[i * 3] = r / 255; out[i * 3 + 1] = g / 255; out[i * 3 + 2] = b / 255;
   }
@@ -169,8 +196,8 @@ function rangeMask(data) {
   return m;
 }
 
-function clippedPoints(data, colors) {
-  const ck = "cp:" + state.colorMode + ":" + state.rangeClip;
+function clippedPoints(data, colors, dark) {
+  const ck = "cp:" + state.colorMode + ":" + state.rangeClip + ":" + (dark ? 1 : 0);
   if (data.colors[ck]) return data.colors[ck];
   const m = rangeMask(data), pts = data.points, n = data.header.n;
   let c = 0; for (let i = 0; i < n; i++) c += m[i];
@@ -342,15 +369,37 @@ const controls = new THREE.OrbitControls(cam3, canvas3d);
 controls.target.set(12, 0, 0);
 scene3.add(new THREE.AxesHelper(3));
 
-const grid3 = new THREE.GridHelper(160, 16, 0x2a3b2f, 0x1a2420);
-grid3.rotation.x = Math.PI / 2;
-scene3.add(grid3);
+let grid3 = null;
+function setGridStep(step) {
+  if (grid3) scene3.remove(grid3);
+  const size = Math.max(240, step * 24);
+  grid3 = new THREE.GridHelper(size, Math.round(size / step), 0x2a3b2f, 0x1a2420);
+  grid3.rotation.x = Math.PI / 2;
+  grid3.material.transparent = true;
+  grid3.material.opacity = 0.9;
+  grid3.renderOrder = -1;
+  grid3.visible = state.showGrid;
+  scene3.add(grid3);
+}
+setGridStep(10);
 
-// OSM map on the ground plane
+// OSM road graph (black polylines over the raster, under the point cloud)
+const roads3 = new THREE.LineSegments(
+  new THREE.BufferGeometry(),
+  new THREE.LineBasicMaterial({ color: 0x101010, transparent: true, opacity: 0.8,
+                                depthWrite: false, depthTest: false }));
+roads3.renderOrder = -1;
+roads3.visible = false;
+scene3.add(roads3);
+
+// OSM map on the ground plane. Drawn first with depthTest off: it is a pure
+// underlay — points/boxes always render over it, never dive under the raster
+// where terrain slopes away from the ego-local ground height.
 const mapPlane = new THREE.Mesh(
   new THREE.PlaneGeometry(1, 1),
-  new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9, depthWrite: false,
-                                side: THREE.DoubleSide }));
+  new THREE.MeshBasicMaterial({ transparent: true, opacity: 0.9,
+                                depthWrite: false, depthTest: false }));
+mapPlane.renderOrder = -2;
 mapPlane.visible = false;
 scene3.add(mapPlane);
 
@@ -364,10 +413,16 @@ scene3.add(mapPlane);
   for (const [a, b] of e) v.push(...c[a], ...c[b]);
   const g = new THREE.BufferGeometry();
   g.setAttribute("position", new THREE.Float32BufferAttribute(v, 3));
-  scene3.add(new THREE.LineSegments(g, new THREE.LineBasicMaterial({ color: 0x66aaff })));
+  const egoBox = new THREE.LineSegments(g, new THREE.LineBasicMaterial({
+    color: 0x66aaff, transparent: true, opacity: 1 }));
+  egoBox.renderOrder = -1;
+  scene3.add(egoBox);
 }
 
-const ptsMat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true, sizeAttenuation: true });
+// transparent+renderOrder channels the draw order explicitly:
+// map(-2) -> roads(-1) -> grid/ego/points/boxes(0) -> labels
+const ptsMat = new THREE.PointsMaterial({ size: 0.06, vertexColors: true,
+  sizeAttenuation: true, transparent: true, opacity: 1 });
 const ptsGeo = new THREE.BufferGeometry();
 ptsGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
 ptsGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
@@ -377,7 +432,8 @@ scene3.add(points3);
 const boxGeo = new THREE.BufferGeometry();
 boxGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
 boxGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
-const boxes3 = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({ vertexColors: true }));
+const boxes3 = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({
+  vertexColors: true, transparent: true, opacity: 1 }));
 scene3.add(boxes3);
 
 // box labels as sprites
@@ -449,8 +505,8 @@ function groundLevel(data) {
 }
 
 function render3d(data) {
-  const colors = pointColors(data, state.colorMode, state.rangeClip);
-  const cp = clippedPoints(data, colors);
+  const colors = pointColors(data, state.colorMode, state.rangeClip, state.showMap3d);
+  const cp = clippedPoints(data, colors, state.showMap3d);
   ptsGeo.setAttribute("position", new THREE.BufferAttribute(cp.pos, 3));
   ptsGeo.setAttribute("color", new THREE.BufferAttribute(cp.col, 3));
   ptsGeo.computeBoundingSphere();
@@ -535,6 +591,24 @@ function render3d(data) {
     } else mapPlane.visible = false;
   } else mapPlane.visible = false;
 
+  // ---- OSM road graph (ego frame, just above the ground plane) ----
+  const mp0 = mapPatch(data.header);
+  if (state.showRoads && state.roadsENU && mp0) {
+    const gz = groundLevel(data) + 0.35;
+    const segs = [];
+    for (const way of state.roadsENU) {
+      let prev = null;
+      for (const [e, n] of way) {
+        const p = mp0.g.map(e, n);
+        if (prev) segs.push(prev[0], prev[1], gz, p[0], p[1], gz);
+        prev = p;
+      }
+    }
+    roads3.geometry.setAttribute("position",
+      new THREE.BufferAttribute(new Float32Array(segs), 3));
+    roads3.visible = segs.length > 0;
+  } else roads3.visible = false;
+
   return cp.n;
 }
 
@@ -584,17 +658,50 @@ function renderBev(data) {
     { step = s; if (s * scale >= 60) break; }
   bevCtx.strokeStyle = "rgba(90,110,125,0.4)";
   bevCtx.lineWidth = 1;
-  bevCtx.font = "16px ui-monospace, monospace";
-  bevCtx.fillStyle = "rgba(160,180,195,0.7)";
   for (let r = step; r <= visR + step; r += step) {
     bevCtx.beginPath(); bevCtx.arc(cx + bevView.x, cy + bevView.y, r * scale, 0, 2 * Math.PI);
     bevCtx.stroke();
-    const [lx, ly] = px(0, 0);
-    bevCtx.fillText(r + "m", lx + 4, cy + bevView.y - r * scale - 4);
+  }
+
+  // ---- metric grid (same step as the 3D grid) ----
+  {
+    const step = state.gridStep * scale;
+    if (step > 14) {
+      bevCtx.strokeStyle = "rgba(70,90,110,0.35)";
+      bevCtx.lineWidth = 1;
+      const ox = (cx + bevView.x) % step, oy = (cy + bevView.y) % step;
+      bevCtx.beginPath();
+      for (let x = ox; x < W; x += step) { bevCtx.moveTo(x, 0); bevCtx.lineTo(x, W); }
+      for (let y = oy; y < W; y += step) { bevCtx.moveTo(0, y); bevCtx.lineTo(W, y); }
+      bevCtx.stroke();
+    }
+  }
+
+  // ---- OSM road graph (black) ----
+  if (state.showRoads && state.roadsENU) {
+    const g = frameGeo(data.header);
+    if (g) {
+      bevCtx.strokeStyle = "#000";
+      bevCtx.lineWidth = Math.max(1, 1.6);
+      bevCtx.globalAlpha = 0.75;
+      bevCtx.beginPath();
+      for (const way of state.roadsENU) {
+        let first = true;
+        for (const [e, n] of way) {
+          const p = g.map(e, n);
+          const sx = cx + bevView.x - p[1] * scale;
+          const sy = cy + bevView.y - p[0] * scale;
+          if (first) bevCtx.moveTo(sx, sy); else bevCtx.lineTo(sx, sy);
+          first = false;
+        }
+      }
+      bevCtx.stroke();
+      bevCtx.globalAlpha = 1;
+    }
   }
 
   // ---- points (offscreen ImageData, composed over the map) ----
-  const colors = pointColors(data, state.colorMode, state.rangeClip);
+  const colors = pointColors(data, state.colorMode, state.rangeClip, state.showMapBev);
   const m = rangeMask(data), pts = data.points, n = data.header.n;
   if (!bevImgData || bevImgData.width !== W)
     bevImgData = bevPtsCtx.createImageData(W, W);
@@ -605,9 +712,9 @@ function renderBev(data) {
     const pxx = (cx + bevView.x - pts[i * 3 + 1] * scale) | 0;
     const pyy = (cy + bevView.y - pts[i * 3 + 0] * scale) | 0;
     if (pxx < 0 || pxx >= W - 1 || pyy < 0 || pyy >= W - 1) continue;
-    const r = Math.min(255, (colors[i * 3] * 255 * 1.45) | 0),
-          g = Math.min(255, (colors[i * 3 + 1] * 255 * 1.45) | 0),
-          b = Math.min(255, (colors[i * 3 + 2] * 255 * 1.45) | 0);
+    const r = Math.min(255, (colors[i * 3] * 255 * (state.showMapBev ? 1.1 : 1.45)) | 0),
+          g = Math.min(255, (colors[i * 3 + 1] * 255 * (state.showMapBev ? 1.1 : 1.45)) | 0),
+          b = Math.min(255, (colors[i * 3 + 2] * 255 * (state.showMapBev ? 1.1 : 1.45)) | 0);
     for (const [ox, oy] of [[0, 0], [1, 0], [0, 1], [1, 1]]) {
       const q = ((pyy + oy) * W + pxx + ox) * 4;
       d[q] = r; d[q + 1] = g; d[q + 2] = b; d[q + 3] = 255;
@@ -641,15 +748,58 @@ function renderBev(data) {
     bevCtx.stroke();
   }
 
-  // ---- ego triangle (points up = forward) ----
-  bevCtx.fillStyle = "#66aaff";
-  const [ex0, ey0] = px(0, 0);
-  bevCtx.beginPath();
-  bevCtx.moveTo(ex0, ey0 - 10);
-  bevCtx.lineTo(ex0 - 7, ey0 + 8);
-  bevCtx.lineTo(ex0 + 7, ey0 + 8);
-  bevCtx.closePath();
-  bevCtx.fill();
+  // ---- ego vehicle (self) box: 4.9 x 2.0 m, heading up (+X) ----
+  {
+    const L = 4.9, W = 2.0;
+    const [fx, fy] = px(L / 2, 0), [bx, by] = px(-L / 2, 0);
+    const [lx, ly] = px(-L / 2, W / 2), [rx, ry] = px(-L / 2, -W / 2);
+    const [lfx, lfy] = px(L / 2 - 0.9, W / 2), [rfx, rfy] = px(L / 2 - 0.9, -W / 2);
+    bevCtx.strokeStyle = "#66aaff";
+    bevCtx.fillStyle = "rgba(102,170,255,0.25)";
+    bevCtx.lineWidth = 2;
+    bevCtx.beginPath();
+    bevCtx.moveTo(fx, fy); bevCtx.lineTo(lfx, lfy); bevCtx.lineTo(lx, ly);
+    bevCtx.lineTo(bx, by); bevCtx.lineTo(rx, ry); bevCtx.lineTo(rfx, rfy);
+    bevCtx.closePath();
+    bevCtx.fill();
+    bevCtx.stroke();
+    // windshield line
+    bevCtx.beginPath();
+    const [wx1, wy1] = px(L / 2 - 1.2, W / 2), [wx2, wy2] = px(L / 2 - 1.2, -W / 2);
+    bevCtx.moveTo(wx1, wy1); bevCtx.lineTo(wx2, wy2);
+    bevCtx.stroke();
+  }
+
+  // ---- compact radius scale (ticks up the ego axis, meters) ----
+  if (state.showBevScale) {
+    const [ex0, ey0] = px(0, 0);
+    const ax = ex0, fs = 15;
+    bevCtx.font = `bold ${fs}px ui-monospace, monospace`;
+    bevCtx.textBaseline = "middle";
+    bevCtx.textAlign = "left";
+    for (let r = step; r <= visR; r += step) {
+      const y = ey0 - r * scale;
+      if (y < 14 || y > W - 6) continue;
+      bevCtx.strokeStyle = "rgba(160,180,195,0.9)";
+      bevCtx.lineWidth = 2;
+      bevCtx.beginPath();
+      bevCtx.moveTo(ax - 5, y); bevCtx.lineTo(ax + 5, y);
+      bevCtx.stroke();
+      const lab = String(r);
+      const tw = bevCtx.measureText(lab).width;
+      bevCtx.fillStyle = "rgba(10,14,18,0.72)";
+      bevCtx.fillRect(ax + 7, y - fs / 2 - 1, tw + 4, fs + 2);
+      bevCtx.fillStyle = "#cfe0ee";
+      bevCtx.fillText(lab, ax + 9, y);
+    }
+    // unit label
+    bevCtx.fillStyle = "rgba(10,14,18,0.72)";
+    bevCtx.fillRect(ax + 7, 10, 18, fs + 2);
+    bevCtx.fillStyle = "#9fb6c6";
+    bevCtx.fillText("m", ax + 11, 10 + (fs + 2) / 2);
+    bevCtx.textAlign = "start";
+    bevCtx.textBaseline = "alphabetic";
+  }
   $("bevRange").textContent = Math.round(BEV_BASE_R / bevView.z) + " m";
 }
 
@@ -699,10 +849,12 @@ function buildCamPanels(camNames) {
     zoomwrap.className = "zoomwrap";
     const img = document.createElement("img");
     img.draggable = false;
-    const cvs = document.createElement("canvas");
+    const cvs = document.createElement("canvas");       // WebGL: lidar points
+    const ovs = document.createElement("canvas");       // 2D: box frames + labels
+    ovs.className = "ovl";
     const name = document.createElement("div");
     name.className = "camname"; name.textContent = cam.replace("_camera", "");
-    zoomwrap.append(img, cvs);
+    zoomwrap.append(img, cvs, ovs);
     div.append(zoomwrap, name);
     grid.append(div);
     const renderer2 = new THREE.WebGLRenderer({ canvas: cvs, alpha: true, antialias: false });
@@ -713,23 +865,11 @@ function buildCamPanels(camNames) {
     geo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
     geo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
     const pts2 = new THREE.Points(geo, new THREE.PointsMaterial({
-      size: 2.2, vertexColors: true, sizeAttenuation: false }));
+      size: 3.0, vertexColors: true, sizeAttenuation: false }));
     scene2.add(pts2);
-    const bgeo = new THREE.BufferGeometry();
-    bgeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
-    bgeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
-    const boxes2 = new THREE.LineSegments(bgeo, new THREE.LineBasicMaterial({ vertexColors: true }));
-    scene2.add(boxes2);
-    const labels = [];
-    for (let i = 0; i < 48; i++) {
-      const l = document.createElement("div");
-      l.className = "lbl"; l.style.display = "none";
-      zoomwrap.append(l);
-      labels.push(l);
-    }
     const p = { div, zoomwrap, img, renderer: renderer2, scene: scene2, cam2d,
-                pts: pts2, boxes: boxes2, labels, z: { s: 1, x: 0, y: 0 },
-                w: 960, h: 540, fit: 1, cam };
+                pts: pts2, ovs, octx: ovs.getContext("2d"),
+                z: { s: 1, x: 0, y: 0 }, w: 960, h: 540, fit: 1, cam };
     camPanels[cam] = p;
     div.onwheel = e => {
       e.preventDefault();
@@ -770,6 +910,7 @@ function setupCamPanelSize(p, w, h) {
   p.img.width = w; p.img.height = h;
   p.zoomwrap.style.width = w + "px"; p.zoomwrap.style.height = h + "px";
   p.renderer.setSize(w, h, false);
+  p.ovs.width = w; p.ovs.height = h;
   p.cam2d.right = w; p.cam2d.top = h;
   p.cam2d.updateProjectionMatrix();
 }
@@ -785,7 +926,7 @@ function renderCamPanel(p, data) {
   if (p.img.dataset.cur !== imgUrl) { p.img.src = imgUrl; p.img.dataset.cur = imgUrl; }
 
   const m = rangeMask(data), n = data.header.n, pts = data.points;
-  const colors = pointColors(data, state.colorMode, state.rangeClip);
+  const colors = pointColors(data, state.colorMode, state.rangeClip, false);
   const R = quatToMat(cd.R), t = cd.t, K = cd.K;
   const uv = new Float32Array(n * 3), col = new Float32Array(n * 3);
   let mm = 0;
@@ -807,54 +948,62 @@ function renderCamPanel(p, data) {
   p.pts.geometry.setAttribute("position", new THREE.BufferAttribute(uv.subarray(0, mm*3), 3));
   p.pts.geometry.setAttribute("color", new THREE.BufferAttribute(col.subarray(0, mm*3), 3));
   p.pts.visible = state.showLidar && mm > 0;
-  p.pts.material.size = 2.2;
 
-  const idx = visibleBoxes(data);
-  const labels = data.header.labels, cols = classColorsFor(labels);
-  const bpos = new Float32Array(idx.length * 24 * 3), bcol = new Float32Array(idx.length * 24 * 3);
-  let segs = 0;
-  const labelInfo = [];
+  // ---- box frames + labels: 2D overlay (thick, crisp, aligned) ----
+  const ctx = p.octx;
+  ctx.clearRect(0, 0, w0, h0);
   if (state.showBoxes) {
+    const scale = 1 / Math.max(p.fit * p.z.s, 1e-3);   // constant screen px size
+    const lw = Math.max(1.2, 2.6 * scale);
+    const fs = Math.max(8, 12 * scale);
+    const idx = visibleBoxes(data);
+    const labels = data.header.labels, cols = classColorsFor(labels);
+    ctx.lineWidth = lw;
+    ctx.font = `bold ${fs}px system-ui`;
+    ctx.textBaseline = "bottom";
     for (const k of idx) {
       const b = data.boxes.subarray(k*7, k*7+7);
       const cor = boxCorners(b);
-      const cc = new Float32Array(24);
+      // project corners -> raw image px (u, v)
+      const uvs = new Array(8);
+      let zmin = Infinity;
       for (let i = 0; i < 8; i++) {
         const ex = cor[i*3] - t[0], ey = cor[i*3+1] - t[1], ez = cor[i*3+2] - t[2];
-        cc[i*3]   = R[0][0]*ex + R[1][0]*ey + R[2][0]*ez;
-        cc[i*3+1] = R[0][1]*ex + R[1][1]*ey + R[2][1]*ez;
-        cc[i*3+2] = R[0][2]*ex + R[1][2]*ey + R[2][2]*ez;
+        const cz = R[0][2]*ex + R[1][2]*ey + R[2][2]*ez;
+        const cx = R[0][0]*ex + R[1][0]*ey + R[2][0]*ez;
+        const cy = R[0][1]*ex + R[1][1]*ey + R[2][1]*ez;
+        uvs[i] = cz > 0.2 ? [(K[0][0]*cx + K[0][2]*cz) / cz,
+                              (K[1][1]*cy + K[1][2]*cz) / cz] : null;
+        if (cz < zmin) zmin = cz;
       }
-      let zmin = Infinity;
-      for (let i = 0; i < 8; i++) zmin = Math.min(zmin, cc[i*3+2]);
-      if (zmin < 0.2) continue;
-      const c = cols[k].rgb.map(v => v / 255);
-      const uvs = [];
-      for (let i = 0; i < 8; i++) {
-        const z = cc[i*3+2];
-        uvs.push([(K[0][0]*cc[i*3] + K[0][2]*z) / z, h0 - (K[1][1]*cc[i*3+1] + K[1][2]*z) / z]);
-      }
+      if (zmin < 0.2 || uvs.some(q => !q)) continue;
+      // skip boxes fully outside the frame
+      let inside = false;
+      for (const q of uvs) if (q[0] >= -50 && q[0] <= w0 + 50 && q[1] >= -50 && q[1] <= h0 + 50) inside = true;
+      if (!inside) continue;
+      const css = cols[k].css;
+      ctx.strokeStyle = css;
+      ctx.beginPath();
       for (const [a, bb] of EDGES) {
-        bpos.set([uvs[a][0], uvs[a][1], 0], segs*3); bcol.set(c, segs*3); segs++;
-        bpos.set([uvs[bb][0], uvs[bb][1], 0], segs*3); bcol.set(c, segs*3); segs++;
+        ctx.moveTo(uvs[a][0], uvs[a][1]);
+        ctx.lineTo(uvs[bb][0], uvs[bb][1]);
       }
-      let top = uvs[4];
-      for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];
-      labelInfo.push({ k, x: top[0], y: top[1] });
+      ctx.stroke();
+      if (state.showCamLbl) {
+        let top = uvs[4];
+        for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];
+        const text = labels[k] || "?";
+        const tw = ctx.measureText(text).width;
+        const pad = 3 * scale;
+        const x = Math.min(Math.max(top[0], tw / 2 + 2), w0 - tw / 2 - 2);
+        const y = Math.max(top[1] - 4 * scale, fs);
+        ctx.fillStyle = "rgba(0,0,0,0.6)";
+        ctx.fillRect(x - tw / 2 - pad, y - fs - pad * 0.5, tw + pad * 2, fs + pad);
+        ctx.fillStyle = css;
+        ctx.fillText(text, x - tw / 2, y);
+      }
     }
   }
-  p.boxes.geometry.setAttribute("position", new THREE.BufferAttribute(bpos.subarray(0, segs*3), 3));
-  p.boxes.geometry.setAttribute("color", new THREE.BufferAttribute(bcol.subarray(0, segs*3), 3));
-  p.boxes.visible = state.showBoxes && segs > 0;
-  p.labels.forEach((l, i) => {
-    if (state.showCamLbl && i < labelInfo.length) {
-      const { k, x, y } = labelInfo[i];
-      l.textContent = labels[k] || "?";
-      l.style.left = x + "px"; l.style.top = y + "px";
-      l.style.color = cols[k].css;
-      l.style.display = "";
-    } else l.style.display = "none";
-  });
   p.renderer.render(p.scene, p.cam2d);
 }
 
@@ -1031,6 +1180,26 @@ async function selectSweep(i, frame = 0) {
   buildClasses();
   state.track = track;
   await buildTripMap();
+  // OSM road graph -> ENU polylines (once per sweep)
+  state.roadsENU = null;
+  api(`/api/osm_roads?sweep=${i}`).then(rd => {
+    if (!rd || !rd.ways || !rd.ways.length || !state.track.aln) return;
+    const aln = state.track.aln;
+    const ca = Math.cos(aln.lat0 * Math.PI / 180);
+    const cA = Math.cos(aln.rot), sA = Math.sin(aln.rot);
+    const out = [];
+    for (const way of rd.ways) {
+      const ptsENU = [];
+      for (const [la, lo] of way) {
+        const e = (lo - aln.lon0) * Math.PI / 180 * R_EARTH * ca;
+        const n = (la - aln.lat0) * Math.PI / 180 * R_EARTH;
+        if (Math.abs(e) < 4000 && Math.abs(n) < 4000) ptsENU.push([e, n]);
+      }
+      if (ptsENU.length > 1) out.push(ptsENU);
+    }
+    state.roadsENU = out;
+    render();
+  }).catch(() => {});
   const pts = [];
   for (let k = 0; k < track.lat.length; k++)
     if (track.lat[k] || track.lon[k]) pts.push([track.lat[k], track.lon[k]]);
@@ -1120,7 +1289,10 @@ $("chkFollow").onchange = e => { state.followMap = e.target.checked; };
 $("chkNms").onchange = e => { state.showNms = e.target.checked; state.cache.clear(); render(); };
 $("chkMap3d").onchange = e => { state.showMap3d = e.target.checked; render(); };
 $("chkMapBev").onchange = e => { state.showMapBev = e.target.checked; render(); };
-$("chkGrid").onchange = e => { state.showGrid = e.target.checked; render(); };
+$("chkGrid").onchange = e => { state.showGrid = e.target.checked; grid3.visible = state.showGrid; };
+$("gridStep").onchange = e => { state.gridStep = +e.target.value; setGridStep(state.gridStep); render(); };
+$("chkRoads").onchange = e => { state.showRoads = e.target.checked; render(); };
+$("chkBevScale").onchange = e => { state.showBevScale = e.target.checked; render(); };
 $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render(); };
 $("chkBev").onchange = e => { state.showBev = e.target.checked; render(); };
 $("colorMode").onchange = e => {

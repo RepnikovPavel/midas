@@ -184,6 +184,15 @@ def make_app(roots, osm_dir=None):
                 return web.json_response(json.load(f))
         return web.json_response(None)
 
+    async def osm_roads(request):
+        i = int(request.query.get("sweep", 0))
+        name = ds.sequence_names()[i]
+        p = os.path.join(app["osm_dir"] or "", "plans", f"{name}_roads.json") \
+            if app["osm_dir"] else ""
+        if p and os.path.exists(p):
+            return web.FileResponse(p, headers={"Cache-Control": "max-age=86400"})
+        return web.json_response({"ways": []})
+
     async def tile(request):
         z = int(request.match_info["z"])
         x = int(request.match_info["x"])
@@ -222,6 +231,7 @@ def make_app(roots, osm_dir=None):
     app.router.add_get("/api/frame", frame)
     app.router.add_get("/api/camimg", camimg)
     app.router.add_get("/api/osm_plan", osm_plan)
+    app.router.add_get("/api/osm_roads", osm_roads)
     app.router.add_get("/api/tile/{z}/{x}/{y}.png", tile)
     app.router.add_static("/static/", STATIC_DIR, show_index=False)
     return app

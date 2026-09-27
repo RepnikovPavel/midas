@@ -32,11 +32,19 @@ from . import geofit
 
 R_EARTH = 6378137.0
 CIRC = 2 * math.pi * R_EARTH
-MARGIN_M = 120.0
+MARGIN_M = 250.0          # lidar range ~200 m -> keep map well past the route
 CANVAS_MAX_PX = 3840.0
 ZMIN, ZMAX = 15, 18
 UA = "pandaset-pipeline-osm-preload/1.0 (contact: dataset viewer; bulk: one-time)"
 UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
+OVERPASS = [  # rotate: public instances, all share the same OSM data
+    "https://maps.mail.ru/osm/tools/overpass/api/interpreter",  # most reliable here
+    "https://overpass-api.de/api/interpreter",
+    "https://overpass.kumi.systems/api/interpreter",
+    "https://overpass.private.coffee/api/interpreter",
+]
+ROADS_QUERY = ("[out:json][timeout:180];"
+               "way['highway']({s},{w},{n},{e});out geom;")
 
 
 def lon2px(lon, z):
@@ -102,6 +110,56 @@ def fetch_tile(z, x, y, out_dir, retries=3):
             time.sleep(1.0 + attempt)
 
 
+def plan_bbox_latlon(plan):
+    """(south, west, north, east) covered by the plan's tile grid."""
+    z = plan["z"]
+    n2 = 256 * 2 ** z
+    west = ((plan["x0"] * 256) / n2 - 0.5) * 360.0
+    east = (((plan["x0"] + plan["ntx"]) * 256) / n2 - 0.5) * 360.0
+    def py2lat(py):
+        r = 2 * math.atan(math.exp((0.5 - py / n2) * 2 * math.pi)) - math.pi / 2
+        return math.degrees(r)
+    north = py2lat(plan["y0"] * 256)
+    south = py2lat((plan["y0"] + plan["nty"]) * 256)
+    return south, west, north, east
+
+
+_road_ep = {"i": 0, "ok": None}
+
+def fetch_roads(plan, out_path, retries=5):
+    """Download the OSM road graph (highway ways) via rotating Overpass mirrors.
+    Tries the last successful mirror first (sticky)."""
+    import urllib.parse
+    s, w, n, e = plan_bbox_latlon(plan)
+    q = ROADS_QUERY.format(s=f"{s:.6f}", w=f"{w:.6f}", n=f"{n:.6f}", e=f"{e:.6f}")
+    order = []
+    start = _road_ep["ok"] if _road_ep["ok"] is not None else _road_ep["i"]
+    for k in range(len(OVERPASS)):
+        order.append(OVERPASS[(start + k) % len(OVERPASS)])
+    for attempt in range(retries):
+        ep = order[min(attempt, len(order) - 1)]
+        try:
+            req = urllib.request.Request(
+                ep + "?data=" + urllib.parse.quote(q), headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=200) as r:
+                data = json.loads(r.read().decode("utf-8"))
+            ways = []
+            for el in data.get("elements", []):
+                if el.get("type") == "way" and "geometry" in el:
+                    ways.append([[p["lat"], p["lon"]] for p in el["geometry"]])
+            with open(out_path + ".tmp", "w") as f:
+                json.dump({"ways": ways}, f)
+            os.replace(out_path + ".tmp", out_path)
+            _road_ep["ok"] = OVERPASS.index(ep)
+            _road_ep["i"] += 1
+            return len(ways)
+        except Exception as ex:  # noqa: BLE001
+            if attempt == retries - 1:
+                print(f"  roads FAIL {ep}: {ex}", flush=True)
+                return -1
+            time.sleep(2.0)
+
+
 def main():
     import glob as _glob
     ap = argparse.ArgumentParser()
@@ -110,6 +168,8 @@ def main():
     ap.add_argument("--only", nargs="*", default=None)
     ap.add_argument("--workers", type=int, default=4,
                     help="parallel tile downloads (be polite to OSM)")
+    ap.add_argument("--skip-roads", action="store_true",
+                    help="do not fetch the OSM road graphs (Overpass)")
     args = ap.parse_args()
 
     seqs = []
@@ -121,6 +181,7 @@ def main():
     print(f"{len(seqs)} sequences; tiles -> {args.out}")
 
     os.makedirs(os.path.join(args.out, "plans"), exist_ok=True)
+    plans = {}
     jobs = queue.Queue()
     n_tiles = 0
     for seq in seqs:
@@ -141,6 +202,7 @@ def main():
             continue
         with open(os.path.join(args.out, "plans", f"{seq}.json"), "w") as f:
             json.dump(plan, f)
+        plans[seq] = plan
         for i in range(plan["ntx"]):
             for j in range(plan["nty"]):
                 jobs.put((plan["z"], plan["x0"] + i, plan["y0"] + j))
@@ -165,6 +227,28 @@ def main():
         list(ex.map(lambda _: worker(), range(args.workers)))
     print(f"tiles: cached={stats['hit']} downloaded={stats['ok']} "
           f"failed={stats['fail']} in {time.time() - t0:.0f}s")
+
+    # ---- OSM road graphs (Overpass), one file per sequence ------------------
+    if not args.skip_roads:
+        todo = [(seq, plan) for seq, plan in sorted(plans.items())
+                if not os.path.exists(
+                    os.path.join(args.out, "plans", f"{seq}_roads.json"))]
+        lock2 = threading.Lock()
+        done_ct = {"ok": 0, "fail": 0}
+
+        def road_job(sp):
+            seq, plan = sp
+            out_path = os.path.join(args.out, "plans", f"{seq}_roads.json")
+            ok = fetch_roads(plan, out_path) >= 0
+            with lock2:
+                done_ct["ok" if ok else "fail"] += 1
+                n = done_ct["ok"] + done_ct["fail"]
+                if n % 10 == 0:
+                    print(f"  roads: {n}/{len(todo)}", flush=True)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            list(ex.map(road_job, todo))
+        print(f"roads: ok={done_ct['ok']} failed={done_ct['fail']}")
     print("DONE" if stats["fail"] == 0 else "DONE (with failures)")
 
 
