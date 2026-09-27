@@ -405,6 +405,7 @@ const roadsMat = new THREE.MeshBasicMaterial({ color: 0x101010, transparent: tru
   opacity: 0.85, depthWrite: false, depthTest: false, side: THREE.DoubleSide });
 const roadsMesh = new THREE.Mesh(new THREE.BufferGeometry(), roadsMat);
 roadsMesh.renderOrder = -1;
+roadsMesh.frustumCulled = false;
 roadsMesh.visible = false;
 scene3.add(roadsMesh);
 const roadsNodes = new THREE.Points(
@@ -451,6 +452,7 @@ const ptsGeo = new THREE.BufferGeometry();
 ptsGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3));
 ptsGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
 const points3 = new THREE.Points(ptsGeo, ptsMat);
+points3.frustumCulled = false;   // geometry updates outpace bounding spheres
 scene3.add(points3);
 
 const boxGeo = new THREE.BufferGeometry();
@@ -458,6 +460,7 @@ boxGeo.setAttribute("position", new THREE.BufferAttribute(new Float32Array(0), 3
 boxGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
 const boxes3 = new THREE.LineSegments(boxGeo, new THREE.LineBasicMaterial({
   vertexColors: true, transparent: true, opacity: 1 }));
+boxes3.frustumCulled = false;
 scene3.add(boxes3);
 
 // accumulated per-track points (acc pts mode)
@@ -467,6 +470,7 @@ accGeo.setAttribute("color", new THREE.BufferAttribute(new Float32Array(0), 3));
 const accPoints3 = new THREE.Points(accGeo, new THREE.PointsMaterial({
   size: 0.05, vertexColors: true, sizeAttenuation: true,
   transparent: true, opacity: 1 }));
+accPoints3.frustumCulled = false;
 scene3.add(accPoints3);
 
 // box labels as sprites
@@ -493,6 +497,7 @@ const labelSprites = [];
 for (let i = 0; i < 256; i++) {
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ depthTest: false }));
   sp.visible = false;
+  sp.frustumCulled = false;
   scene3.add(sp);
   labelSprites.push(sp);
 }
