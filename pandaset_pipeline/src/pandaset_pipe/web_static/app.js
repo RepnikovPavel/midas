@@ -79,6 +79,7 @@ const state = {
   showMap3d: true, showMapBev: true, showGrid: false, showLabels3d: true,
   showBev: true, showRoads: true, showBevScale: true, gridStep: 10, followMap: true,
   showTrackId: false, accPts: false, accTracks: null, accSweep: -1,
+  deskew: false,
   ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
   hiddenClasses: new Set(), classColors: {},
@@ -119,11 +120,12 @@ function decodeF16(bits, n) {
 }
 
 async function loadFrame(sweep, frame) {
-  const key = `${sweep}:${frame}:${state.showNms ? 1 : 0}`;
+  const key = `${sweep}:${frame}:${state.showNms ? 1 : 0}:${state.deskew ? 1 : 0}`;
   if (state.cache.has(key)) return state.cache.get(key);
   const t0 = performance.now();
   const p = (async () => {
-    const r = await fetch(`/api/frame?sweep=${sweep}&frame=${frame}&nms=${state.showNms ? 1 : 0}`);
+    const r = await fetch(`/api/frame?sweep=${sweep}&frame=${frame}` +
+                          `&nms=${state.showNms ? 1 : 0}&deskew=${state.deskew ? 1 : 0}`);
     const buf = await r.arrayBuffer();
     const dv = new DataView(buf);
     const jl = dv.getUint32(0, true);
@@ -1420,6 +1422,11 @@ $("chkRoads").onchange = e => { state.showRoads = e.target.checked; render(); };
 $("chkBevScale").onchange = e => { state.showBevScale = e.target.checked; render(); };
 $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render(); };
 $("chkTrackId").onchange = e => { state.showTrackId = e.target.checked; render(); };
+$("chkDeskew").onchange = e => {
+  state.deskew = e.target.checked;
+  state.cache.clear();
+  render();
+};
 $("chkAccPts").onchange = e => {
   state.accPts = e.target.checked;
   if (state.accPts) loadAcc();

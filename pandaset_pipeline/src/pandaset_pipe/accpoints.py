@@ -20,7 +20,51 @@ Binary response layout (served as /api/acc):
 Per segment: absolute byte offsets into the blobs.
 """
 
+import os
+
 import numpy as np
+
+_POSE_CACHE = {}
+
+
+def _ego_world(sw, j):
+    """(R, t) ego(frame j) -> world, from the lidar npz pose."""
+    key = (sw.path, j)
+    if key not in _POSE_CACHE:
+        import numpy as _np
+        lz = _np.load(os.path.join(sw.path, f"lidar_{sw.timestamps[j]}.npz"))
+        q = lz["ego2global_rotation"].astype(_np.float64)
+        w, x, y, z = q
+        R = _np.array([
+            [1-2*(y*y+z*z), 2*(x*y-w*z), 2*(x*z+w*y)],
+            [2*(x*y+w*z), 1-2*(x*x+z*z), 2*(y*z-w*x)],
+            [2*(x*z-w*y), 2*(y*z+w*x), 1-2*(x*x+y*y)]])
+        t = lz["ego2global_translation"].astype(_np.float64)
+        if len(_POSE_CACHE) > 200:
+            _POSE_CACHE.clear()
+        _POSE_CACHE[key] = (R, t)
+    return _POSE_CACHE[key]
+
+
+def _box_world_pose(sw, j, k):
+    """World (t_ms, center, yaw) of boxes-npz row k at frame j."""
+    d = np.load(os.path.join(sw.path, f"boxes_{sw.timestamps[j]}.npz"))
+    b = d["boxes"][k].astype(np.float64)
+    q = d["ego2global_rotation"].astype(np.float64)
+    w, x, y, z = q
+    ego_yaw = np.arctan2(2 * (w * z + x * y), 1 - 2 * (y * y + z * z))
+    c, s = np.cos(ego_yaw), np.sin(ego_yaw)
+    R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+    c_w = R @ b[:3] + d["ego2global_translation"].astype(np.float64)
+    return (float(sw.timestamps[j]), c_w, float(ego_yaw + b[6]))
+
+
+def _update_prev_pose(rec, sw, j, k):
+    try:
+        rec["prev_pose"] = _box_world_pose(sw, j, k)
+    except Exception:  # noqa: BLE001
+        pass
+
 
 VOXEL = 0.05          # local-frame downsample grid, m (bounded payload)
 DIM_TOL = 0.06        # max dimension variation for a "constant shape" track
@@ -29,20 +73,36 @@ SWITCH_RATIO = 1.3    # challenger needs this multiple of the owner's count
 SWITCH_RUN = 2        # ... for this many consecutive frames
 
 
-def accumulate_sweep(sw, labels=("Car",)):
-    """Full forward pass. Returns (header, pts_blob, birth_blob)."""
+VEHICLE_LABELS = ("Car", "Pickup Truck", "Medium-sized Truck")
+
+
+def accumulate_sweep(sw, labels=VEHICLE_LABELS):
+    """Full forward pass. Returns (header, pts_blob, birth_blob).
+
+    Per-point OBJECT-motion compensation: a spinning sweep spans ~100 ms, so
+    the box itself moves while being scanned. Each point, measured at
+    t_i = ts + rel_time, is referenced through the track's WORLD pose
+    interpolated at t_i (between the bracketing frames' box poses) instead of
+    the frame-instant pose — this removes the intra-sweep arc shear that
+    otherwise cuts the accumulated object.
+    """
     tracks = {}   # tid -> record
     for j in range(len(sw)):
         snap = sw[j]
         pts = snap.points
         if not len(pts):
             continue
-        sid = snap.sensor_id
+        lz = np.load(os.path.join(sw.path, f"lidar_{sw.timestamps[j]}.npz"))
+        sid = lz["sensor_id"]
+        rt = lz["rel_time"].astype(np.float64)
         boxes = snap.boxes
         if not len(boxes):
             continue
         labels_arr = snap.box_labels
         uuids = snap.box_uuids
+        # world pose of each current box (for the object-motion interpolation)
+        bd = np.load(os.path.join(sw.path, f"boxes_{sw.timestamps[j]}.npz")) \
+            if False else None
         for k in range(len(boxes)):
             lab = str(labels_arr[k])
             if lab not in labels:
@@ -66,6 +126,7 @@ def accumulate_sweep(sw, labels=("Car",)):
                     "dims": np.array([dx, dy, dz], np.float64),
                     "label": lab, "segs": [], "owner": None,
                     "challenger": None, "run": 0,
+                    "prev_pose": None,   # (t_ms, c_w, yaw_w) of previous frame
                 }
             elif np.abs(rec["dims"] - [dx, dy, dz]).max() > DIM_TOL:
                 rec["dead"] = True

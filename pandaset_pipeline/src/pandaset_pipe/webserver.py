@@ -19,7 +19,8 @@ from aiohttp import web
 
 from .reader import PandaDataset
 from . import geofit
-from .accpoints import accumulate_sweep
+from .accpoints import accumulate_sweep, VEHICLE_LABELS
+from .deskew import deskew
 
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "web_static")
 OSM_UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
@@ -319,13 +320,18 @@ def make_app(roots, osm_dir=None):
         return web.json_response(await loop.run_in_executor(
             app["executor"], gps_track, i))
 
-    def _frame_sync(i, j, use_nms):
+    def _frame_sync(i, j, use_nms, do_deskew):
         sw = ds[i]
         j = max(0, min(j, len(sw) - 1))
         snap = sw[j]
         # raw lidar npz: keep points as stored (fp16) -> half the payload
         lz = np.load(os.path.join(sw.path, f"lidar_{sw.timestamps[j]}.npz"))
-        pts = lz["points"]
+        if do_deskew:
+            # ego-motion compensation of the spinning lidar: every point is
+            # re-referenced from its own measurement time to the frame instant
+            pts = deskew(sw, j, snap.points.astype(np.float64), lz["rel_time"])
+        else:
+            pts = lz["points"]
         pts_dtype = pts.dtype
         inten = lz["intensity"]
         ego_t = lz["ego2global_translation"]
@@ -393,8 +399,10 @@ def make_app(roots, osm_dir=None):
         i = int(request.query.get("sweep", 0))
         j = int(request.query.get("frame", 0))
         use_nms = request.query.get("nms", "1") != "0"
+        do_deskew = request.query.get("deskew", "0") == "1"
         loop = asyncio.get_event_loop()
-        body = await loop.run_in_executor(app["executor"], _frame_sync, i, j, use_nms)
+        body = await loop.run_in_executor(app["executor"], _frame_sync,
+                                          i, j, use_nms, do_deskew)
         return web.Response(body=body, content_type="application/octet-stream",
                             headers={"Cache-Control": "no-store"})
 
@@ -464,7 +472,7 @@ def make_app(roots, osm_dir=None):
         if i in app["acc_cache"]:
             return app["acc_cache"][i]
         sw = ds[i]
-        header, pts_blob, birth_blob = accumulate_sweep(sw)
+        header, pts_blob, birth_blob = accumulate_sweep(sw, VEHICLE_LABELS)
         tid = _track_id_map(sw)
         header["tracks"] = {str(tid.get(u, -1)): t
                             for u, t in header["tracks"].items()}
