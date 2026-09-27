@@ -78,7 +78,7 @@ const state = {
   showLidar: true, showBoxes: true, showCamLbl: true, showNms: true,
   showMap3d: true, showMapBev: true, showGrid: false, showLabels3d: true,
   showBev: true, showRoads: true, showBevScale: true, gridStep: 10, followMap: true,
-  ptSize: 0.06, rangeClip: Infinity,
+  showTrackId: false, ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
   hiddenClasses: new Set(), classColors: {},
   track: null,               // gps track + world<->ENU alignment of current sweep
@@ -549,10 +549,12 @@ function render3d(data) {
 
   let li = 0;
   if (state.showLabels3d) {
+    const ids = data.header.ids || [];
     for (; li < Math.min(idx.length, labelSprites.length); li++) {
       const k = idx[li], b = data.boxes.subarray(k * 7, k * 7 + 7);
       const sp = labelSprites[li];
-      const tex = labelTexture(labels[k] || "?", cols[k].css);
+      const txt = state.showTrackId ? (ids[k] || "?") : (labels[k] || "?");
+      const tex = labelTexture(txt, cols[k].css);
       sp.material.map = tex; sp.material.needsUpdate = true;
       sp.position.set(b[0], b[1], b[2] + b[5] / 2 + 1.2);
       const h = 1.3;
@@ -1041,6 +1043,7 @@ function renderCamPanel(p, data) {
       const Rw2e = quatToMat(cd.ib_e2g.slice(3, 7));   // world_from_ego @ t_cam
       const tw = cd.ib_e2g.slice(0, 3);
       const withQuat = cd.ib.length && cd.ib[0].length === 10;
+      const ids = cd.ib_ids || [];
       for (let k = 0; k < cd.ib.length; k++) {
         const lab = cd.ib_labels[k] || "?";
         if (!boxVisible(lab)) continue;
@@ -1065,13 +1068,14 @@ function renderCamPanel(p, data) {
           cor[i*3+1] = Rw2e[0][1]*dx + Rw2e[1][1]*dy + Rw2e[2][1]*dz;
           cor[i*3+2] = Rw2e[0][2]*dx + Rw2e[1][2]*dy + Rw2e[2][2]*dz;
         }
-        items.push({ cor, lab });
+        items.push({ cor, lab, id: ids[k] || "" });
       }
     } else {
       const labels = data.header.labels;
+      const ids = data.header.ids || [];
       for (const k of visibleBoxes(data))
         items.push({ cor: boxCorners(data.boxes.subarray(k * 7, k * 7 + 7)),
-                     lab: labels[k] || "?" });
+                     lab: labels[k] || "?", id: ids[k] || "" });
     }
     ctx.lineWidth = lw;
     ctx.font = `bold ${fs}px system-ui`;
@@ -1104,7 +1108,7 @@ function renderCamPanel(p, data) {
       if (state.showCamLbl) {
         let top = uvs[4];
         for (let i = 4; i < 8; i++) if (uvs[i][1] < top[1]) top = uvs[i];
-        const text = it.lab;
+        const text = state.showTrackId ? (it.id || it.lab) : it.lab;
         const tw2 = ctx.measureText(text).width;
         const pad = 3 * uiScale;
         const x = Math.min(Math.max(top[0], tw2 / 2 + 2), w0 - tw2 / 2 - 2);
@@ -1367,6 +1371,7 @@ $("gridStep").onchange = e => { state.gridStep = +e.target.value; setGridStep(st
 $("chkRoads").onchange = e => { state.showRoads = e.target.checked; render(); };
 $("chkBevScale").onchange = e => { state.showBevScale = e.target.checked; render(); };
 $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render(); };
+$("chkTrackId").onchange = e => { state.showTrackId = e.target.checked; render(); };
 $("chkBev").onchange = e => { state.showBev = e.target.checked; render(); };
 $("colorMode").onchange = e => {
   state.colorMode = e.target.value;

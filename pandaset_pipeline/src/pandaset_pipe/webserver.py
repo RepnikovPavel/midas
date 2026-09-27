@@ -178,7 +178,7 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
     e2g = np.concatenate([t0 + a_e * (t1 - t0), _quat_slerp(q0, q1, a_e)])
 
     # ---- per-track interpolation / extrapolation onto ts_cam ----
-    boxes, labels = [], []
+    boxes, labels, uuids = [], [], []
     for uuid, ss in samples.items():
         ss.sort(key=lambda s: s[0])
         if len(ss) == 1:
@@ -204,9 +204,11 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
             qb = _quat_slerp(qa, qb2, a)
         boxes.append([cen[0], cen[1], cen[2], dx, dy, dz] + list(qb))
         labels.append(lab)
+        uuids.append(uuid)
     if not boxes:
         return None
-    return np.array(boxes, dtype=np.float64), labels, e2g.tolist()
+    return (np.array(boxes, dtype=np.float64), labels, e2g.tolist(),
+            [u[:8] for u in uuids])
 
 
 def make_app(roots, osm_dir=None):
@@ -221,7 +223,8 @@ def make_app(roots, osm_dir=None):
     app["executor"] = concurrent.futures.ThreadPoolExecutor(max_workers=4)
 
     async def index(request):
-        return web.FileResponse(os.path.join(STATIC_DIR, "index.html"))
+        return web.FileResponse(os.path.join(STATIC_DIR, "index.html"),
+                                headers={"Cache-Control": "no-cache, must-revalidate"})
 
     async def sweeps(request):
         return web.json_response({
@@ -333,13 +336,15 @@ def make_app(roots, osm_dir=None):
             ib = _interp_cam_boxes(sw, ts_cam, use_nms=use_nms,
                                    cur_idx=j, cur_offsets=cur_offsets)
             if ib is not None:
-                boxes_c, labels_c, e2g_c = ib
+                boxes_c, labels_c, e2g_c, ids_c = ib
                 cams[cam]["ib"] = boxes_c.astype(float).tolist()
                 cams[cam]["ib_labels"] = labels_c
+                cams[cam]["ib_ids"] = ids_c
                 cams[cam]["ib_e2g"] = e2g_c
         header = {
             "ts": snap.ts, "n": len(pts), "nb": len(boxes),
             "labels": [str(x) for x in labels],
+            "ids": [str(u)[:8] for u in snap.box_uuids],
             "gps": snap.gps, "cams": cams,
             "frame": j, "frames": len(sw),
             "pts_dtype": str(pts_dtype),
