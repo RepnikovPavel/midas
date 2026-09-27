@@ -6,6 +6,7 @@ html, body { margin: 0; height: 100%; background: #0b0e11; color: #d7dde3;
 #topbar { display: flex; align-items: center; gap: 14px; padding: 5px 10px;
   background: #12161b; border-bottom: 1px solid #232a31; flex-wrap: nowrap; }
 #logo { font-weight: 800; letter-spacing: .06em; color: #6cf; font-size: 15px; }
+#ver { font-size: 10px; color: #7d8f9d; font-weight: 600; vertical-align: super; }
 .tb { white-space: nowrap; color: #9fb0bd; }
 .tb.mono, .mono { font-family: ui-monospace, Menlo, Consolas, monospace; }
 #speedo { font: 700 20px/1 ui-monospace, Menlo, Consolas, monospace; color: #4f6;

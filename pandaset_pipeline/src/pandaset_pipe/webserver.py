@@ -39,7 +39,35 @@ def _quat_slerp(q0, q1, a):
     return (np.sin((1 - a) * th) * q0 + np.sin(a * th) * q1) / np.sin(th)
 
 
-def _interp_cam_boxes(sw, ts_cam, use_nms=True, max_gap_ms=150):
+_SENSOR_TS_CACHE = {}   # (sweep_path, frame_idx) -> {sensor_id: median rel_time}
+
+
+def _sensor_time_offsets(sw, j, cur_idx, cur_offsets):
+    """Median rel_time per lidar sensor for frame j (dual-sensor sweeps:
+    Pandar64 and PandarGT have different capture times inside one merged
+    frame). Cached; the current frame's offsets are reused when passed."""
+    if j == cur_idx:
+        return cur_offsets
+    key = (sw.path, j)
+    if key in _SENSOR_TS_CACHE:
+        return _SENSOR_TS_CACHE[key]
+    off = {}
+    try:
+        d = np.load(os.path.join(sw.path, f"lidar_{sw.timestamps[j]}.npz"))
+        rt, sid = d["rel_time"], d["sensor_id"]
+        for s in (0, 1):
+            m = sid == s
+            if m.sum():
+                off[s] = float(np.median(rt[m]))
+    except OSError:
+        pass
+    if len(_SENSOR_TS_CACHE) > 40:
+        _SENSOR_TS_CACHE.clear()
+    _SENSOR_TS_CACHE[key] = off
+    return off
+
+
+def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
     """Boxes + ego pose interpolated onto a camera's own timestamp.
 
     Cameras are not synchronized with the lidar: projecting lidar-frame boxes
@@ -58,13 +86,11 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, max_gap_ms=150):
     i = bisect.bisect_left(ts, ts_cam)
     j1 = min(max(i, 0), n - 1)
     j0 = min(max(i - 1, 0), n - 1)
-    if j1 == j0:
-        a = 0.0
-    else:
-        a = (ts_cam - ts[j0]) / (ts[j1] - ts[j0])
-        a = min(max(a, 0.0), 1.0)
+    # per-sensor sweep time offsets for both bracketing frames
+    off0 = _sensor_time_offsets(sw, j0, cur_idx, cur_offsets or {})
+    off1 = _sensor_time_offsets(sw, j1, cur_idx, cur_offsets or {})
 
-    def load(j):
+    def load(j, off):
         p = os.path.join(sw.path, f"boxes_{ts[j]}.npz")
         if not os.path.exists(p):
             return None
@@ -76,23 +102,26 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, max_gap_ms=150):
         b = d["boxes"].astype(np.float64)
         labels = d["class_names"]
         uuids = d["uuids"]
+        sids = d["sensor_id"]
         if use_nms and "nms_keep" in d.files:
             keep = d["nms_keep"].astype(bool)
-            b, labels, uuids = b[keep], labels[keep], uuids[keep]
+            b, labels, uuids, sids = b[keep], labels[keep], uuids[keep], sids[keep]
+        # yaw-only ego rotation: pandaset world poses are essentially yaw + tiny
+        # pitch/roll; box centers sit near the ground so the error is cm-scale
+        c, s = np.cos(yaw), np.sin(yaw)
+        Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
+        cen_w = (Rz @ b[:, :3].T).T + t
         out = {}
         for k in range(len(b)):
-            pw = np.array([b[k, 0], b[k, 1], b[k, 2], 1.0])
-            # ego2global with yaw-only rotation is not enough for z; use full Rz:
-            # box centers are near ground so Rz approximation is fine for x,y
-            c, s = np.cos(yaw), np.sin(yaw)
-            Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-            cen = Rz @ b[k, :3] + t
-            out[str(uuids[k])] = (cen, b[k, 3], b[k, 4], b[k, 5],
-                                  b[k, 6] + yaw, str(labels[k]))
+            sid = int(sids[k]) if sids[k] is not None else -1
+            # this box's own capture time: its sensor's sweep offset
+            tb = ts[j] + off.get(sid, 0.0) * 1000.0
+            out[str(uuids[k])] = (cen_w[k], b[k, 3], b[k, 4], b[k, 5],
+                                  b[k, 6] + yaw, str(labels[k]), tb, sid)
         return out, t, q
 
-    L0 = load(j0)
-    L1 = load(j1)
+    L0 = load(j0, off0)
+    L1 = load(j1, off1)
     if L0 is None and L1 is None:
         return None
     if L0 is None:
@@ -101,11 +130,16 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, max_gap_ms=150):
         L1 = L0
     b0, t0, q0 = L0
     b1, t1, q1 = L1
-    e2g = np.concatenate([t0 + a * (t1 - t0), _quat_slerp(q0, q1, a)])
+    dt = float(ts[j1] - ts[j0])
+    # ego pose interpolated onto the camera timestamp
+    a_pose = min(max((ts_cam - ts[j0]) / dt, 0.0), 1.0) if dt else 0.0
+    e2g = np.concatenate([t0 + a_pose * (t1 - t0), _quat_slerp(q0, q1, a_pose)])
     boxes, labels = [], []
-    for uuid, (c0, dx, dy, dz, yaw0, lab) in b0.items():
+    for uuid, (c0, dx, dy, dz, yaw0, lab, tb0, sid) in b0.items():
+        # per-box interpolation fraction on the box's own sensor timeline
+        a = min(max((ts_cam - tb0) / dt, 0.0), 1.0) if dt else 0.0
         if uuid in b1:
-            c1, _, _, _, yaw1, _ = b1[uuid]
+            c1, _, _, _, yaw1, _, _, _ = b1[uuid]
             cen = c0 + a * (c1 - c0)
             dyaw = (yaw1 - yaw0 + np.pi) % (2 * np.pi) - np.pi
             yaw = yaw0 + a * dyaw
@@ -206,6 +240,12 @@ def make_app(roots, osm_dir=None):
         sem = snap.semseg
         if sem is None:
             sem = np.zeros(len(pts), np.uint8)
+        # per-sensor sweep time offsets of THIS merged frame (dual lidar)
+        cur_offsets = {}
+        for s in (0, 1):
+            msk = lz["sensor_id"] == s
+            if msk.sum():
+                cur_offsets[s] = float(np.median(lz["rel_time"][msk]))
         if use_nms:
             boxes, labels = snap.boxes_nms()
         else:
@@ -229,8 +269,10 @@ def make_app(roots, osm_dir=None):
                 "w": int(entry["image"].shape[1]),
                 "h": int(entry["image"].shape[0]),
             }
-            # boxes interpolated onto THIS camera's own timestamp (async sensors)
-            ib = _interp_cam_boxes(sw, ts_cam, use_nms=use_nms)
+            # boxes interpolated onto THIS camera's own timestamp (async
+            # sensors + dual-lidar per-box sensor timelines)
+            ib = _interp_cam_boxes(sw, ts_cam, use_nms=use_nms,
+                                   cur_idx=j, cur_offsets=cur_offsets)
             if ib is not None:
                 boxes_c, labels_c, e2g_c = ib
                 cams[cam]["ib"] = boxes_c.astype(float).tolist()
