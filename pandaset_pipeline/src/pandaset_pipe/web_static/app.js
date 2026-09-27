@@ -76,7 +76,7 @@ const state = {
   sweeps: [], counts: [], sweep: 0, frame: 0, frames: 1,
   playing: true, dataFps: 5, colorMode: "height",
   showLidar: true, showBoxes: true, showCamLbl: true, showNms: true,
-  showMap3d: true, showMapBev: true, showGrid: true, showLabels3d: true,
+  showMap3d: true, showMapBev: true, showGrid: false, showLabels3d: true,
   showBev: true, showRoads: true, showBevScale: true, gridStep: 10, followMap: true,
   ptSize: 0.06, rangeClip: Infinity,
   hasSemseg: false, semsegClasses: {}, boxClasses: {},
@@ -384,14 +384,20 @@ function setGridStep(step) {
 }
 setGridStep(10);
 
-// OSM road graph (black polylines over the raster, under the point cloud)
-const roads3 = new THREE.LineSegments(
+// OSM road graph over the raster: flat quads (WebGL lines are 1px) + node dots
+const roadsMat = new THREE.MeshBasicMaterial({ color: 0x101010, transparent: true,
+  opacity: 0.85, depthWrite: false, depthTest: false, side: THREE.DoubleSide });
+const roadsMesh = new THREE.Mesh(new THREE.BufferGeometry(), roadsMat);
+roadsMesh.renderOrder = -1;
+roadsMesh.visible = false;
+scene3.add(roadsMesh);
+const roadsNodes = new THREE.Points(
   new THREE.BufferGeometry(),
-  new THREE.LineBasicMaterial({ color: 0x101010, transparent: true, opacity: 0.8,
-                                depthWrite: false, depthTest: false }));
-roads3.renderOrder = -1;
-roads3.visible = false;
-scene3.add(roads3);
+  new THREE.PointsMaterial({ color: 0x101010, size: 1.1, sizeAttenuation: true,
+    transparent: true, opacity: 0.9, depthWrite: false, depthTest: false }));
+roadsNodes.renderOrder = -1;
+roadsNodes.visible = false;
+scene3.add(roadsNodes);
 
 // OSM map on the ground plane. Drawn first with depthTest off: it is a pure
 // underlay — points/boxes always render over it, never dive under the raster
@@ -597,19 +603,38 @@ function render3d(data) {
   const mp0 = mapPatch(data.header);
   if (state.showRoads && state.roadsENU && mp0) {
     const gz = groundLevel(data) + 0.35;
-    const segs = [];
+    const quad = [], nodes = [];
+    const HALF_W = 0.45;  // road ribbon half-width, m
     for (const way of state.roadsENU) {
       let prev = null;
       for (const [e, n] of way) {
         const p = mp0.g.map(e, n);
-        if (prev) segs.push(prev[0], prev[1], gz, p[0], p[1], gz);
+        nodes.push(p[0], p[1], gz + 0.05);
+        if (prev) {
+          const dx = p[0] - prev[0], dy = p[1] - prev[1];
+          const l = Math.hypot(dx, dy) || 1;
+          const nx = -dy / l * HALF_W, ny = dx / l * HALF_W;
+          // two triangles of a flat quad
+          quad.push(prev[0] + nx, prev[1] + ny, gz,
+                    prev[0] - nx, prev[1] - ny, gz,
+                    p[0] - nx, p[1] - ny, gz,
+                    prev[0] + nx, prev[1] + ny, gz,
+                    p[0] - nx, p[1] - ny, gz,
+                    p[0] + nx, p[1] + ny, gz);
+        }
         prev = p;
       }
     }
-    roads3.geometry.setAttribute("position",
-      new THREE.BufferAttribute(new Float32Array(segs), 3));
-    roads3.visible = segs.length > 0;
-  } else roads3.visible = false;
+    roadsMesh.geometry.setAttribute("position",
+      new THREE.BufferAttribute(new Float32Array(quad), 3));
+    roadsMesh.visible = quad.length > 0;
+    roadsNodes.geometry.setAttribute("position",
+      new THREE.BufferAttribute(new Float32Array(nodes), 3));
+    roadsNodes.visible = nodes.length > 0;
+  } else {
+    roadsMesh.visible = false;
+    roadsNodes.visible = false;
+  }
 
   return cp.n;
 }
@@ -679,13 +704,13 @@ function renderBev(data) {
     }
   }
 
-  // ---- OSM road graph (black) ----
+  // ---- OSM road graph (black, thick) + graph nodes ----
   if (state.showRoads && state.roadsENU) {
     const g = frameGeo(data.header);
     if (g) {
       bevCtx.strokeStyle = "#000";
-      bevCtx.lineWidth = Math.max(1, 1.6);
-      bevCtx.globalAlpha = 0.75;
+      bevCtx.lineWidth = 3;
+      bevCtx.globalAlpha = 0.8;
       bevCtx.beginPath();
       for (const way of state.roadsENU) {
         let first = true;
@@ -698,6 +723,19 @@ function renderBev(data) {
         }
       }
       bevCtx.stroke();
+      // nodes
+      bevCtx.fillStyle = "#000";
+      for (const way of state.roadsENU) {
+        for (const [e, n] of way) {
+          const p = g.map(e, n);
+          const sx = cx + bevView.x - p[1] * scale;
+          const sy = cy + bevView.y - p[0] * scale;
+          if (sx < -4 || sx > W + 4 || sy < -4 || sy > W + 4) continue;
+          bevCtx.beginPath();
+          bevCtx.arc(sx, sy, 2.5, 0, 2 * Math.PI);
+          bevCtx.fill();
+        }
+      }
       bevCtx.globalAlpha = 1;
     }
   }
