@@ -25,6 +25,36 @@ OSM_UPSTREAM = "https://tile.openstreetmap.org/{z}/{x}/{y}.png"
 UA = "pandaset-pipeline-viewer/1.0"
 
 
+def _mat_to_quat(R):
+    """3x3 rotation -> quaternion (w, x, y, z)."""
+    t = np.trace(R)
+    if t > 0.0:
+        s = np.sqrt(t + 1.0) * 2.0
+        return np.array([0.25 * s, (R[2, 1] - R[1, 2]) / s,
+                         (R[0, 2] - R[2, 0]) / s, (R[1, 0] - R[0, 1]) / s])
+    i = int(np.argmax(np.diag(R)))
+    if i == 0:
+        s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
+        return np.array([(R[2, 1] - R[1, 2]) / s, 0.25 * s,
+                         (R[0, 1] + R[1, 0]) / s, (R[0, 2] + R[2, 0]) / s])
+    if i == 1:
+        s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
+        return np.array([(R[0, 2] - R[2, 0]) / s, (R[0, 1] + R[1, 0]) / s,
+                         0.25 * s, (R[1, 2] + R[2, 1]) / s])
+    s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
+    return np.array([(R[1, 0] - R[0, 1]) / s, (R[0, 2] + R[2, 0]) / s,
+                     (R[1, 2] + R[2, 1]) / s, 0.25 * s])
+
+
+def _quat_to_mat(q):
+    w, x, y, z = np.asarray(q, float) / np.linalg.norm(q)
+    return np.array([
+        [1 - 2 * (y * y + z * z), 2 * (x * y - w * z), 2 * (x * z + w * y)],
+        [2 * (x * y + w * z), 1 - 2 * (x * x + z * z), 2 * (y * z - w * x)],
+        [2 * (x * z - w * y), 2 * (y * z + w * x), 1 - 2 * (x * x + y * y)],
+    ])
+
+
 def _quat_slerp(q0, q1, a):
     """Quaternion slerp (wxyz), numpy."""
     q0 = np.asarray(q0, float) / np.linalg.norm(q0)
@@ -96,9 +126,8 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
             return None
         d = np.load(p, allow_pickle=True)
         t = d["ego2global_translation"].astype(np.float64)
-        q = d["ego2global_rotation"].astype(np.float64)
-        yaw = np.arctan2(2 * (q[0] * q[3] + q[1] * q[2]),
-                         1 - 2 * (q[2] ** 2 + q[3] ** 2))
+        q_ego = d["ego2global_rotation"].astype(np.float64)
+        R_e2w = _quat_to_mat(q_ego)                     # full ego->world rotation
         b = d["boxes"].astype(np.float64)
         labels = d["class_names"]
         uuids = d["uuids"]
@@ -106,19 +135,19 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
         if use_nms and "nms_keep" in d.files:
             keep = d["nms_keep"].astype(bool)
             b, labels, uuids, sids = b[keep], labels[keep], uuids[keep], sids[keep]
-        # yaw-only ego rotation: pandaset world poses are essentially yaw + tiny
-        # pitch/roll; box centers sit near the ground so the error is cm-scale
-        c, s = np.cos(yaw), np.sin(yaw)
-        Rz = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]])
-        cen_w = (Rz @ b[:, :3].T).T + t
         out = {}
         for k in range(len(b)):
             sid = int(sids[k]) if sids[k] is not None else -1
-            # this box's own capture time: its sensor's sweep offset
+            # this box's own capture time: its sensor's sweep offset (dual lidar)
             tb = ts[j] + off.get(sid, 0.0) * 1000.0
-            out[str(uuids[k])] = (cen_w[k], b[k, 3], b[k, 4], b[k, 5],
-                                  b[k, 6] + yaw, str(labels[k]), tb, sid)
-        return out, t, q
+            cen_w = R_e2w @ b[k, :3] + t
+            yaw = b[k, 6]
+            Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
+                           [np.sin(yaw), np.cos(yaw), 0], [0, 0, 1]])
+            q_box = _mat_to_quat(R_e2w @ Rz)            # exact box pose in world
+            out[str(uuids[k])] = (cen_w, b[k, 3], b[k, 4], b[k, 5],
+                                  q_box, str(labels[k]), tb)
+        return out, t, q_ego
 
     L0 = load(j0, off0)
     L1 = load(j1, off1)
@@ -135,17 +164,16 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
     a_pose = min(max((ts_cam - ts[j0]) / dt, 0.0), 1.0) if dt else 0.0
     e2g = np.concatenate([t0 + a_pose * (t1 - t0), _quat_slerp(q0, q1, a_pose)])
     boxes, labels = [], []
-    for uuid, (c0, dx, dy, dz, yaw0, lab, tb0, sid) in b0.items():
+    for uuid, (c0, dx, dy, dz, q_box0, lab, tb0) in b0.items():
         # per-box interpolation fraction on the box's own sensor timeline
         a = min(max((ts_cam - tb0) / dt, 0.0), 1.0) if dt else 0.0
         if uuid in b1:
-            c1, _, _, _, yaw1, _, _, _ = b1[uuid]
+            c1, _, _, _, q_box1, _, _ = b1[uuid]
             cen = c0 + a * (c1 - c0)
-            dyaw = (yaw1 - yaw0 + np.pi) % (2 * np.pi) - np.pi
-            yaw = yaw0 + a * dyaw
+            q_box = _quat_slerp(q_box0, q_box1, a)
         else:
-            cen, yaw = c0, yaw0
-        boxes.append([cen[0], cen[1], cen[2], dx, dy, dz, yaw])
+            cen, q_box = c0, q_box0
+        boxes.append([cen[0], cen[1], cen[2], dx, dy, dz] + list(q_box))
         labels.append(lab)
     return np.array(boxes, dtype=np.float64), labels, e2g.tolist()
 

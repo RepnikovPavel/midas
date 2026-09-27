@@ -1008,19 +1008,27 @@ function renderCamPanel(p, data) {
     if (cd.ib) {
       const Rw2e = quatToMat(cd.ib_e2g.slice(3, 7));   // world_from_ego @ t_cam
       const tw = cd.ib_e2g.slice(0, 3);
+      const withQuat = cd.ib.length && cd.ib[0].length === 10;
       for (let k = 0; k < cd.ib.length; k++) {
         const lab = cd.ib_labels[k] || "?";
         if (!boxVisible(lab)) continue;
         const b = cd.ib[k];
-        const cs = Math.cos(b[6]), sn = Math.sin(b[6]);
+        // box axes in world: full quaternion (exact) or yaw fallback
+        let Rb;
+        if (withQuat) Rb = quatToMat([b[6], b[7], b[8], b[9]]);
+        else {
+          const cs = Math.cos(b[6]), sn = Math.sin(b[6]);
+          Rb = [[cs, -sn, 0], [sn, cs, 0], [0, 0, 1]];
+        }
         const cor = new Float32Array(24);
         for (let i = 0; i < 8; i++) {
           const lx = BOX_SIGNS[i][0] * b[3], ly = BOX_SIGNS[i][1] * b[4],
                 lz = BOX_SIGNS[i][2] * b[5];
-          const wx = cs * lx - sn * ly + b[0];
-          const wy = sn * lx + cs * ly + b[1];
-          const wz = lz + b[2];
-          const dx = wx - tw[0], dy = wy - tw[1], dz = wz - tw[2];
+          // corner in world: full rotation, then world -> ego(t_cam)
+          const vx = Rb[0][0] * lx + Rb[0][1] * ly + Rb[0][2] * lz + b[0];
+          const vy = Rb[1][0] * lx + Rb[1][1] * ly + Rb[1][2] * lz + b[1];
+          const vz = Rb[2][0] * lx + Rb[2][1] * ly + Rb[2][2] * lz + b[2];
+          const dx = vx - tw[0], dy = vy - tw[1], dz = vz - tw[2];
           cor[i*3]   = Rw2e[0][0]*dx + Rw2e[1][0]*dy + Rw2e[2][0]*dz;
           cor[i*3+1] = Rw2e[0][1]*dx + Rw2e[1][1]*dy + Rw2e[2][1]*dz;
           cor[i*3+2] = Rw2e[0][2]*dx + Rw2e[1][2]*dy + Rw2e[2][2]*dz;
