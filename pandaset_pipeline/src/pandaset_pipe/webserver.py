@@ -159,8 +159,12 @@ def _interp_cam_boxes(sw, ts_cam, use_nms=True, cur_idx=None, cur_offsets=None):
         out = {}
         for k in range(len(b)):
             sid = int(sids[k]) if sids[k] is not None else -1
-            # this detection's own capture time: its sensor's sweep offset
-            tb = ts[j] + off.get(sid, 0.0) * 1000.0
+            # this detection's own capture time: its sensor's sweep offset.
+            # sid=-1 (unattributed, the majority) is stamped on the PRIMARY
+            # Pandar64 sweep: fitted photometrically from track 49 (seq 002,
+            # frames 8-11) at ts-46ms +- 6ms ~= sensor-0 sweep (-48ms).
+            off_sid = off.get(sid, off.get(0, 0.0))
+            tb = ts[j] + off_sid * 1000.0
             cen_w = R_e2w @ b[k, :3] + t
             yaw = b[k, 6]
             Rz = np.array([[np.cos(yaw), -np.sin(yaw), 0],
