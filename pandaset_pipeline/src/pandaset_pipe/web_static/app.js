@@ -459,7 +459,7 @@ function labelTexture(text, css) {
   return tex;
 }
 const labelSprites = [];
-for (let i = 0; i < 96; i++) {
+for (let i = 0; i < 256; i++) {
   const sp = new THREE.Sprite(new THREE.SpriteMaterial({ depthTest: false }));
   sp.visible = false;
   scene3.add(sp);
@@ -803,7 +803,6 @@ function renderBev(data) {
     bevCtx.textAlign = "start";
     bevCtx.textBaseline = "alphabetic";
   }
-  $("bevRange").textContent = Math.round(BEV_BASE_R / bevView.z) + " m";
 }
 
 // BEV navigation: wheel zoom to cursor, drag pan, double-click reset
@@ -1103,49 +1102,6 @@ $("timeline").addEventListener("click", e => {
   setFrame(Math.round((e.clientX - r.left) / r.width * (state.frames - 1)));
 });
 
-// ------------------------------------------------------------ classes popover
-function buildClasses() {
-  const body = $("classesBody");
-  body.innerHTML = "";
-  if (state.colorMode === "semseg") {
-    $("classesTitle").textContent = "semseg classes";
-    const entries = Object.entries(state.semsegClasses).sort((a, b) => a[0] - b[0]);
-    if (!entries.length) {
-      body.innerHTML = "<div style='color:#7d8f9d;padding:2px 4px'>no semseg classes</div>";
-      return;
-    }
-    for (const [id, name] of entries) {
-      const p = SEMSEG_PALETTE[+id] || [128, 128, 128];
-      const chip = document.createElement("div");
-      chip.className = "chip";
-      chip.innerHTML = `<span class="sw" style="background:rgb(${p[0]},${p[1]},${p[2]})"></span>` +
-        `<span>${name}</span>`;
-      body.append(chip);
-    }
-    return;
-  }
-  $("classesTitle").textContent = "box classes (click to filter)";
-  const entries = Object.entries(state.boxClasses).sort((a, b) => b[1] - a[1]);
-  if (!entries.length) {
-    body.innerHTML = "<div style='color:#7d8f9d;padding:2px 4px'>no boxes in sequence</div>";
-    return;
-  }
-  for (const [name, cnt] of entries) {
-    const col = state.classColors[name] || (state.classColors[name] = classColor(name));
-    const chip = document.createElement("div");
-    chip.className = "chip" + (state.hiddenClasses.has(name) ? " off" : "");
-    chip.innerHTML = `<span class="sw" style="background:${col.css}"></span>` +
-      `<span>${name}</span><span class="cnt">${fmt(cnt)}</span>`;
-    chip.onclick = () => {
-      if (state.hiddenClasses.has(name)) state.hiddenClasses.delete(name);
-      else state.hiddenClasses.add(name);
-      buildClasses();
-      render();
-    };
-    body.append(chip);
-  }
-}
-
 // ------------------------------------------------------------ sequencing
 function syncUrl() {
   const name = state.sweeps[state.sweep];
@@ -1180,11 +1136,13 @@ async function selectSweep(i, frame = 0) {
   state.frame = Math.min(frame, meta.frames - 1);
   $("slider").max = Math.max(0, meta.frames - 1);
   buildCamPanels(meta.cameras);
-  buildClasses();
   state.track = track;
   await buildTripMap();
   // OSM road graph -> ENU polylines (once per sweep)
   state.roadsENU = null;
+  const chkR = $("chkRoads");
+  chkR.disabled = true;
+  chkR.title = "road graph not downloaded for this sequence yet";
   api(`/api/osm_roads?sweep=${i}`).then(rd => {
     if (!rd || !rd.ways || !rd.ways.length || !state.track.aln) return;
     const aln = state.track.aln;
@@ -1201,6 +1159,8 @@ async function selectSweep(i, frame = 0) {
       if (ptsENU.length > 1) out.push(ptsENU);
     }
     state.roadsENU = out;
+    chkR.disabled = false;
+    chkR.title = "draw the OSM road graph (black lines)";
     render();
   }).catch(() => {});
   const pts = [];
@@ -1300,7 +1260,6 @@ $("chkLabels3d").onchange = e => { state.showLabels3d = e.target.checked; render
 $("chkBev").onchange = e => { state.showBev = e.target.checked; render(); };
 $("colorMode").onchange = e => {
   state.colorMode = e.target.value;
-  buildClasses();
   render();
 };
 $("ptSize").oninput = e => { state.ptSize = +e.target.value / 100; render(); };
@@ -1312,15 +1271,6 @@ $("rangeClip").oninput = e => {
 };
 $("sweepSel").onchange = e => selectSweep(+e.target.value);
 $("slider").oninput = e => { pause(); setFrame(+e.target.value); };
-$("btnClasses").onclick = e => {
-  e.stopPropagation();
-  $("classes-pop").hidden = !$("classes-pop").hidden;
-};
-document.addEventListener("click", e => {
-  const pop = $("classes-pop");
-  if (!pop.hidden && !pop.contains(e.target) && e.target.id !== "btnClasses")
-    pop.hidden = true;
-});
 $("btnHelp").onclick = () => $("help").hidden = !$("help").hidden;
 $("btnHelpClose").onclick = () => $("help").hidden = true;
 
@@ -1336,9 +1286,9 @@ window.addEventListener("keydown", e => {
       ? ["height", "intensity", "range", "semseg"] : ["height", "intensity", "range"];
     const m = modes[(modes.indexOf(state.colorMode) + 1) % modes.length];
     $("colorMode").value = m; state.colorMode = m;
-    buildClasses(); render();
+    render();
   } else if (e.key === "h" || e.key === "?") $("help").hidden = !$("help").hidden;
-  else if (e.key === "Escape") { $("help").hidden = true; $("classes-pop").hidden = true; }
+  else if (e.key === "Escape") $("help").hidden = true;
 });
 
 // debugging aid (browser console)

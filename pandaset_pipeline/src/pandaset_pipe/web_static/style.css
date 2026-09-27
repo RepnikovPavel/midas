@@ -36,11 +36,11 @@ label { user-select: none; }
   backdrop-filter: blur(3px); overflow: hidden; cursor: grab;
   box-shadow: 0 0 12px rgba(0, 0, 0, .6); }
 #bev-wrap:active { cursor: grabbing; }
-#bev-wrap .panel-hdr { color: #b8cadb; }
-#bev { width: 100%; height: calc(100% - 20px); display: block; }
+#bev { width: 100%; height: 100%; display: block; }
 
-#hud3d { left: 10px; top: 10px; padding: 6px 9px; display: flex;
-  flex-direction: column; gap: 4px; font-size: 12px; }
+#hud3d { left: 10px; top: 10px; padding: 6px 9px;
+  display: grid; grid-template-columns: auto auto; gap: 3px 14px;
+  font-size: 12px; align-items: center; }
 #hud3d input[type=range] { width: 90px; vertical-align: middle; }
 
 #loading { position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
